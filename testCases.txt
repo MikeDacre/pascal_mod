@@ -1,0 +1,1 @@
+./Pascal --pval=resources/gwas/EUR.CARDIoGRAM_2010_lipids.HDL_ONE.txt --chr=22 

@@ -1,0 +1,10 @@
+Manifest-Version: 1.0
+Class-Path: . pascalDeployed_lib/commons-math3-3.2-javadoc.jar pascalD
+ eployed_lib/commons-math3-3.2-sources.jar pascalDeployed_lib/commons-
+ math3-3.2-test-sources.jar pascalDeployed_lib/commons-math3-3.2-tests
+ .jar pascalDeployed_lib/commons-math3-3.2.jar pascalDeployed_lib/jna-
+ 4.1.0.jar pascalDeployed_lib/mtj-1.0-snapshot.jar pascalDeployed_lib/
+ javastat_beta1.4.jar pascalDeployed_lib/junit.jar pascalDeployed_lib/
+ jsc.jar pascalDeployed_lib/jopt-simple-4.3.jar
+Main-Class: ch.unil.genescore.main.Main
+
