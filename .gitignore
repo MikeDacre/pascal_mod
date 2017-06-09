@@ -1,0 +1,12 @@
+# Ipython
+.ipynb_checkpoints
+
+# Apple's junk
+.DS_Store
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Pyenv
+.python-version
