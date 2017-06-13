@@ -35,7 +35,15 @@ except ImportError:
 
 # For progress bar
 try:
-    from tqdm import tqdm as _pb
+    from tqdm import tqdm as _tqdm
+    from tqdm import tqdm_notebook as _tqnb
+    try:
+        if str(type(get_ipython())) == "<class 'ipykernel.zmqshell.ZMQInteractiveShell'>":
+            _pb = _tqnb
+        else:
+            _pb = _tqdm
+    except NameError:
+        _pb = _tqdm
 except ImportError:
     _pb = None
 
@@ -224,6 +232,8 @@ class CombinedData(object):
     fgenescores : DataFrame
     pathway : DataFrame
     snperr : DataFrame
+    perm_count : int
+        A count of the number of permutations parsed successfully
     length_differences : str
         A string describing the length differences between sample and merged
         dataframes
@@ -242,6 +252,7 @@ class CombinedData(object):
     snperr      = _pd.DataFrame
     perms_added = False
     diffs_done  = False
+    perm_count  = 0
 
     def __init__(self, directory, prefix_1=None, prefix_2=None,
                  suffix_1=None, suffix_2=None, merge_prefix=None):
@@ -439,6 +450,8 @@ class CombinedData(object):
         perm_fgenescores = []
         perm_pathway     = []
         self.perm_count  = 0
+        if _pb:
+            pbar = _pb(unit=' perms')
         for pdir in [_pth(perm_dir, f) for f in _os.listdir(perm_dir)]:
             if not '_perm_' in _os.path.basename(pdir):
                 continue
@@ -472,7 +485,12 @@ class CombinedData(object):
             perm_pathway.append(data.pathway[cols].rename(
                 columns={i: 'perm_' + i for i in cols[1:-1]}
             ))
+            if _pb:
+                pbar.update()
             self.perm_count += 1
+        if _pb:
+            pbar.close()
+
         if self.perm_count >= 1:
             self.perm_genescores  = _pd.concat(perm_genescores)
             self.perm_fgenescores = _pd.concat(perm_fgenescores)
@@ -548,6 +566,23 @@ class CombinedData(object):
         )
         self.diffs_done = True
 
+    def __repr__(self):
+        return (
+            "CombinedData<{}:genescores[{}],fgenescores[{}],"
+            "pathwayset[{}],snperr[{}]>"
+        ).format(
+            _os.path.join(self.directory, self.prefix),
+            len(self.genescores),
+            len(self.fgenescores),
+            len(self.pathway),
+            len(self.snperr)
+        )
+
+    def __len__(self):
+        """Alias for perm_count."""
+        return self.perm_count
+
+
     def plot(self, table, modifier=None, xlabel=None, ylabel=None, title=None,
              write_to=None):
         """Plot a -log10 pvalue scatter graph for the given table.
@@ -607,6 +642,9 @@ class CombinedData(object):
 
         f, a = _plots.scatter(**kwargs)
 
+        if write_to:
+            f.savefig(write_to)
+
         return f, a
 
 
@@ -657,8 +695,13 @@ def run_pascal_comp(sample_1, sample_2, outdir='.', merge_prefix=None,
     CombinedData
         A CombinedData object containing all merged and sample DataFrames
     """
-    assert _os.path.isfile(sample_1)
-    assert _os.path.isfile(sample_2)
+    for fl in [sample_1, sample_2]:
+        bad = []
+        if not _os.path.isfile(fl):
+            bad.append(fl)
+        if bad:
+            outstr = 'file' if len(bad) == 1 else 'files:'
+            raise OSError('Cannot find {} {}'.format(outstr, bad))
     if not _os.path.isdir(outdir):
         _os.makedirs(outdir)
     outdir = _os.path.abspath(outdir)
@@ -767,7 +810,7 @@ def plot_comparisons(data, folder=None, tables=None):
 
 def run_permutation(sample_1, sample_2, outdir, perms=1000,
                     sample_1_label='sample_1', sample_2_label='sample_2',
-                    mem_per_job='8G', wait=True, start_perms=None,
+                    mem_per_job='10000', wait=True, start_perms=None,
                     fyrd_args=None, **pascalargs):
     """Permute data from two sample sets and run pascal on each combination.
 
@@ -826,15 +869,14 @@ def run_permutation(sample_1, sample_2, outdir, perms=1000,
     outdir    = _os.path.abspath(outdir)
     perm_path = _pth(outdir, 'perm_files')
     job_path  = _pth(outdir, 'jobs')
+    if not _os.path.isdir(outdir):
+        _os.makedirs(outdir)
     if not _os.path.isdir(perm_path):
         _os.mkdir(perm_path)
     if not _os.path.isdir(job_path):
         _os.mkdir(job_path)
     #  if not _fyrd:
         #  pool = _mp.Pool()
-    ttl = perms
-    if _pb:
-        pbar = _pb(total=ttl, unit='perms')
 
     jobs  = {}
     if start_perms:
@@ -850,6 +892,9 @@ def run_permutation(sample_1, sample_2, outdir, perms=1000,
         perm = max(done_perms)+1 if done_perms else 1
 
     print('Running {} permutations starting at {}'.format(perms, perm))
+    ttl = perms
+    if _pb:
+        pbar = _pb(total=ttl, unit='perms')
     while perms:
         # Permute data
         this_perm = _np.random.permutation(rsids)
@@ -906,14 +951,16 @@ def run_permutation(sample_1, sample_2, outdir, perms=1000,
                 cores      = 2,
                 mem        = mem_per_job,
                 scriptpath = job_path,
-                outpath    = new_outdir,
+                outpath    = job_path,
                 **fyrd_args
             )
         )
         perms -= 1
         perm  += 1
-        pbar.update()
-    pbar.close()
+        if _pb:
+            pbar.update()
+    if _pb:
+        pbar.close()
 
     if not wait:
         return
@@ -940,7 +987,7 @@ def run_permutation(sample_1, sample_2, outdir, perms=1000,
 
 def analyse_comparison(sample_1, sample_2, outdir, perms=1000,
                        sample_1_label='sample_1', sample_2_label='sample_2',
-                       mem_per_job='8G', start_perms=None,
+                       mem_per_job='10000', start_perms=None,
                        fyrd_args=None, **pascalargs):
     """Run the complete analysis pipeline.
 
@@ -1017,7 +1064,7 @@ def analyse_comparison(sample_1, sample_2, outdir, perms=1000,
         cores      = 2,
         mem        = mem_per_job,
         scriptpath = job_path,
-        outpath    = outdir,
+        outpath    = job_path,
         **fyrd_args
     )
 
@@ -1077,8 +1124,11 @@ def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
     -------
     CombinedData
     """
+    print('Getting Data')
     data = CombinedData(directory, prefix_1, prefix_2, suffix_1, suffix_2)
+    print('Getting Permutations')
     data.add_perms(perm_dir=perm_dir, prefix=merge_prefix)
+    print('{} permutations found'.format(data.perm_count))
     data.compare_to_perms()
     return data
 
@@ -1250,13 +1300,18 @@ def argument_parser(get_pascal_args=False):
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show debug output')
 
+    ###################################
+    #  Shared parser for outdir only  #
+    ###################################
+
+    shared_outdir = _argparse.ArgumentParser(add_help=False)
+    shared_outdir.add_argument('outdir', help='Directory to output files to')
+
     ############################################
     #  Shared parser for all pascal arguments  #
     ############################################
 
     shared_parent = _argparse.ArgumentParser(add_help=False)
-    shared_parent.add_argument('-o', '--outdir',
-                               help='Directory to output files to')
     shared_parent.add_argument('--outsuffix',
                                help=(
                                    'Adds an additional string to the output file '
@@ -1358,6 +1413,18 @@ def argument_parser(get_pascal_args=False):
     if get_pascal_args:
         return shared_parent.format_help()
 
+    ###########################################
+    #  Shared Parser for All Comparison Runs  #
+    ###########################################
+
+    shared_comp = _argparse.ArgumentParser(add_help=False)
+    shared_comp.add_argument('sample_1', help='File of rsid\\tpval to analyze')
+    shared_comp.add_argument('sample_2', help='File of rsid\\tpval to analyze')
+    shared_comp.add_argument('--s1-label', default='sample_1',
+                             help='A label to use for sample_1')
+    shared_comp.add_argument('--s2-label', default='sample_2',
+                             help='A label to use for sample_2')
+
     #######################################
     #  Shared Parser For Cluster Running  #
     #######################################
@@ -1376,6 +1443,15 @@ def argument_parser(get_pascal_args=False):
                          help='Fyrd profile to use (cluster running only)')
     cluster.add_argument('--keep-job-files', action='store_false',
                          help='Do not delete job files (cluster running only)')
+    cluster.add_argument('--perms', default=1000, type=int,
+                         help='Number of permutations to run')
+    cluster.add_argument('--no-wait', action='store_false',
+                         help='Do not wait for permutations to finish')
+    cluster.add_argument('--mem', default='8G',
+                         help='Amount of memory to request per permutation')
+    cluster.add_argument('--start-at', type=int,
+                         help='Start from permutation #')
+
 
     ##################################################
     #  Define Run modes, independent of pascal args  #
@@ -1385,81 +1461,52 @@ def argument_parser(get_pascal_args=False):
 
     # Run simply with only one sample
     single = modes.add_parser(
-        'single', parents=[shared_parent],
+        'single', parents=[shared_outdir, shared_parent],
         help="Run pascal directly on a single dataset"
     )
     single.add_argument('snp_file', help='File of rsid\\tpval to analyze')
 
     # Run a simple comparison
     double = modes.add_parser(
-        'double', parents=[shared_parent],
+        'double', parents=[shared_outdir, shared_comp, shared_parent],
         help="Run pascal on two datasets and created merge comparison files." +
         " Runs in parallel with two cores."
     )
-    double.add_argument('sample_1', help='File of rsid\\tpval to analyze')
-    double.add_argument('sample_2', help='File of rsid\\tpval to analyze')
-    double.add_argument('--s1-label', default='sample_1',
-                        help='A label to use for sample_1')
-    double.add_argument('--s2-label', default='sample_2',
-                        help='A label to use for sample_2')
     double.add_argument('--prefix',
                         help="A prefix to use for merged file names.")
 
     # Run permutations only
-    perms = modes.add_parser(
-        'permute', parents=[shared_cluster, shared_parent],
+    modes.add_parser(
+        'permute',
+        parents=[shared_outdir, shared_comp, shared_cluster, shared_parent],
         help="Run pascal permutations, randomizes contents of two samples " +
         "and runs pascal on each. Defaults to use a cluster with the fyrd " +
         "module. Each permutation should take around 2 minutes and 8G of " +
         "memory. If fyrd is not installed, local threads are used."
     )
-    perms.add_argument('sample_1', help='File of rsid\\tpval to analyze')
-    perms.add_argument('sample_2', help='File of rsid\\tpval to analyze')
-    perms.add_argument('--s1-label', default='sample_1',
-                       help='A label to use for sample_1')
-    perms.add_argument('--s2-label', default='sample_2',
-                       help='A label to use for sample_2')
-    perms.add_argument('--perms', default=1000, type=int,
-                       help='Number of permutations to run')
-    perms.add_argument('--no-wait', action='store_false',
-                       help='Do not wait for permutations to finish')
-    perms.add_argument('--mem', default='8G',
-                       help='Amount of memory to request per permutation')
-    perms.add_argument('--start-at', type=int,
-                       help='Start from permutation #')
 
     # Run permutations only
-    analyze = modes.add_parser(
-        'analyze', parents=[shared_cluster, shared_parent],
+    modes.add_parser(
+        'analyze',
+        parents=[shared_outdir, shared_comp, shared_cluster, shared_parent],
         help="Runs a complete analysis on the cluster, including the main " +
         "analysis, permutations, and plotting. Plotting is done locally."
     )
-    analyze.add_argument('sample_1', help='File of rsid\\tpval to analyze')
-    analyze.add_argument('sample_2', help='File of rsid\\tpval to analyze')
-    analyze.add_argument('--s1-label', default='sample_1',
-                         help='A label to use for sample_1')
-    analyze.add_argument('--s2-label', default='sample_2',
-                         help='A label to use for sample_2')
-    analyze.add_argument('--perms', default=1000, type=int,
-                         help='Number of permutations to run')
-    analyze.add_argument('--no-wait', action='store_false',
-                         help='Do not wait for permutations to finish')
-    analyze.add_argument('--mem', default='8G',
-                         help='Amount of memory to request per permutation')
-    analyze.add_argument('--start-at', type=int,
-                         help='Start from permutation #')
+
+    # Write Updated DFs with permutation info
+    parse = modes.add_parser(
+        'parse', parents=[shared_outdir, shared_comp],
+        help="Parse a directory containing combined data and permutations " +
+        "and create new tables with integrated permutation information."
+    )
+    parse.add_argument('--plot', action='store_true',
+                       help="Also write plot files for all tables")
 
     # Write Plots
     plot = modes.add_parser(
-        'plot',
+        'plot', parents=[shared_outdir, shared_comp],
         help="Create scatter plots of exiting data."
     )
-    plot.add_argument('sample_1', help='File of rsid\\tpval analyzed')
-    plot.add_argument('sample_2', help='File of rsid\\tpval analyzed')
-    plot.add_argument('--s1-label', default='sample_1',
-                      help='A label to use for sample_1')
-    plot.add_argument('--s2-label', default='sample_2',
-                      help='A label to use for sample_2')
 
     return parser
 
@@ -1490,8 +1537,6 @@ def main(argv=None):
     opts = vars(args)
     if VERBOSE:
         print(opts)
-    settings = _os.path.abspath(opts.pop('settings'))
-    opts.update(dict(set=settings))
 
     outdir = args.outdir
     outdir = _os.path.abspath(outdir if outdir.strip() else _os.curdir)
@@ -1500,11 +1545,12 @@ def main(argv=None):
         sample_file = opts.pop('snp_file')
         code = run_pascal(sample_file, **opts)[3]
         return code
-    elif mode == 'double':
-        sample_1 = opts.pop('sample_1')
-        sample_2 = opts.pop('sample_2')
-        sample_1_label = opts.pop('s1_label')
-        sample_2_label = opts.pop('s2_label')
+
+    sample_1 = opts.pop('sample_1')
+    sample_2 = opts.pop('sample_2')
+    sample_1_label = opts.pop('s1_label')
+    sample_2_label = opts.pop('s2_label')
+    if mode == 'double':
         merge_prefix = opts.pop('prefix')
         if not merge_prefix:
             merge_prefix = _os.path.basename(outdir)
@@ -1515,10 +1561,6 @@ def main(argv=None):
                         **opts)
         return 0
     elif mode == 'permute':
-        sample_1 = opts.pop('sample_1')
-        sample_2 = opts.pop('sample_2')
-        sample_1_label = opts.pop('s1_label')
-        sample_2_label = opts.pop('s2_label')
         wait = opts.pop('no_wait')
         perms = opts.pop('perms')
         startat = opts.pop('start_at')
@@ -1541,10 +1583,6 @@ def main(argv=None):
                         **opts)
         return 0
     elif mode == 'analyze':
-        sample_1 = opts.pop('sample_1')
-        sample_2 = opts.pop('sample_2')
-        sample_1_label = opts.pop('s1_label')
-        sample_2_label = opts.pop('s2_label')
         wait = opts.pop('no_wait')
         perms = opts.pop('perms')
         startat = opts.pop('start_at')
@@ -1566,16 +1604,23 @@ def main(argv=None):
                            start_perms=startat, fyrd_args=fyrd_args,
                            **opts)
         return 0
-    elif mode == 'plot':
-        sample_1 = opts.pop('sample_1')
-        sample_2 = opts.pop('sample_2')
-        sample_1_label = opts.pop('s1_label')
-        sample_2_label = opts.pop('s2_label')
+    elif mode == 'parse' or mode == 'plot':
         prefix_1 = _os.path.splitext(_os.path.basename(sample_1))[0]
         prefix_2 = _os.path.splitext(_os.path.basename(sample_2))[0]
-        data = get_completed_data(outdir, prefix_1, prefix_2)
-        plot_comparisons(data)
-
+        data = get_completed_data(
+            outdir, prefix_1, prefix_2,
+            suffix_1=sample_1_label, suffix_2=sample_2_label
+        )
+        if mode == 'parse':
+            print('Writing updated tables')
+            data.write()
+        if mode == 'plot' or args.plot:
+            print('Plotting data')
+            plot_comparisons(data)
+        return 0
+    else:
+        parser.print_help()
+        return 1
 
 if __name__ == '__main__' and '__file__' in globals():
     _sys.exit(main())
