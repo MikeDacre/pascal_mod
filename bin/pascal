@@ -5,20 +5,55 @@ Rewrite of the shell script for easy running from anywhere with cluster support
 """
 from __future__ import print_function
 import os as _os
+from os.path import join as _pth
 import sys as _sys
+from time import sleep as _sleep
 import subprocess as _sub
 import argparse as _argparse
 import multiprocessing as _mp
+from random import randint as _randint
+
+# For analysis
+try:
+    import pandas as _pd
+except ImportError:
+    _pd = None
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+try:
+    from scipy import stats as _sts
+except ImportError:
+    _sts = None
+try:
+    # github.com/MikeDacre/mike_tools
+    _sys.path.append('/home/dacre/code/mike_tools/python')
+    import plots as _plots
+except ImportError:
+    _plots = None
+
+# For progress bar
+try:
+    from tqdm import tqdm as _pb
+except ImportError:
+    _pb = None
+
+
+try:
+    import fyrd as _fyrd
+except ImportError:
+    _fyrd = None
 
 VERBOSE = False  # Show debug output
 
 ###############################################################################
-#                          Main Execution Functions                           #
+#                           Main Execution Function                           #
 ###############################################################################
 
 
-def run_pascal(sample_file, **kwargs):
-    """Run the pascal Java command."""
+def run_pascal(sample_file, verbose=False, **kwargs):
+    """Run the pascal Java command, please include outdir in kwargs."""
     cmnd = (
         'export DYLD_LIBRARY_PATH={path}/lib:$LD_LIBRARY_PATH; \n'
         'export LD_LIBRARY_PATH="{path}/lib:{path}/lib/openBLASlib/lib:'
@@ -37,16 +72,1015 @@ def run_pascal(sample_file, **kwargs):
     if not _os.path.isdir(outdir):
         _os.mkdir(outdir)
 
+    name = _os.path.join(
+        outdir,
+        _os.path.splitext(_os.path.basename(sample_file))[0]
+    )
+
     try:
         _os.chdir(path)
-        if VERBOSE:
+        if verbose:
             print(cmnd.format(path=path, mem=mem, args=argstr))
         print('Running Pascal on {}'.format(sample_file))
         out, err, code = _run(cmnd.format(path=path, mem=mem, args=argstr))
     finally:
         _os.chdir(strtdir)
 
+    with open(name + '.out', 'w') as fout:
+        fout.write(out)
+    with open(name + '.err', 'w') as fout:
+        fout.write(err)
+
     return out, err, code
+
+
+###############################################################################
+#                               Parsing Pascal                                #
+###############################################################################
+
+
+class PascalData(object):
+
+    """DataFrame representations of the outputs from pascal.
+
+    Attributes
+    ----------
+    genescores : DataFrame
+    fgenescores : DataFrame
+    pathway : DataFrame
+    snperr : DataFrame
+    """
+
+    genescores  = _pd.DataFrame()
+    fgenescores = _pd.DataFrame()
+    pathway     = _pd.DataFrame()
+    snperr      = _pd.DataFrame()
+
+    def __init__(self, directory, prefix):
+        """Initialize DataFrames from a pascal output directory.
+
+        Parameters
+        ----------
+        directory : str
+            The directory where the outputs are located
+        prefix : str
+            The prefix, which comes from the name of the input file minus the
+            file extension
+        """
+        self.directory = directory
+        self.prefix    = prefix
+        assert _os.path.isdir(directory)
+        self.genefile   = None
+        self.fgenefile  = None
+        self.snperrfile = None
+        self.pathfile   = None
+        for fl in _os.listdir(directory):
+            if not _os.path.basename(fl).startswith(prefix):
+                continue
+            fl = _os.path.join(directory, fl.strip())
+            if fl.endswith('.fusion.genescores.txt'):
+                self.fgenefile = fl
+            elif fl.endswith('.genescores.txt'):
+                self.genefile = fl
+            elif fl.endswith('.numSnpError.txt'):
+                self.snperrfile = fl
+            elif 'PathwaySet' in fl:
+                self.pathfile = fl
+        missing = []
+        if not self.genefile:
+            missing.append('genescores')
+        if not self.fgenefile:
+            missing.append('fgenescores')
+        if not self.pathfile:
+            missing.append('pathway')
+        if not self.snperrfile:
+            missing.append('snperr')
+        if missing:
+            fstr = 'file is' if len(missing) == 1 else 'files are'
+            raise OSError(
+                'The {} {} missing from the output directory {}.'
+                .format(', '.join(missing), fstr, directory)
+            )
+        self.genescores  = _pd.read_csv(self.genefile, sep='\t')
+        self.fgenescores = _pd.read_csv(self.fgenefile, sep='\t')
+        self.pathway     = _pd.read_csv(self.pathfile, sep='\t')
+        self.snperr      = _pd.read_csv(self.snperrfile, sep='\t')
+
+    def __repr__(self):
+        return (
+            "PascalData<{}:genescores[{}],fgenescores[{}],"
+            "pathwayset[{}],snperr[{}]>"
+        ).format(
+            _os.path.join(self.directory, self.prefix),
+            len(self.genescores),
+            len(self.fgenescores),
+            len(self.pathway),
+            len(self.snperr)
+        )
+
+
+def run_parse_pascal(sample_file, outdir='.', **pascalargs):
+    """Parse a sample file with pascal and return a PascalData object.
+
+    Parameters
+    ----------
+    sample_file : str
+        Path to a sample file (a newline separated list of
+    outdir : str
+    pascalargs : keyword arguments
+        Any of the pascal arguments (to see these, run
+        argument_parser(get_pascal_args=True)
+
+    Returns
+    -------
+    PascalData
+    """
+    if not _pd:
+        raise ImportError('cannot parse pascal output without pandas')
+    if not pascalargs:
+        pascalargs = dict(outdir=outdir)
+    else:
+        pascalargs.update(dict(outdir=outdir))
+    out, err, code = run_pascal(sample_file, **pascalargs)
+    if code != 0:
+        raise _sub.CalledProcessError(code, 'pascal', output=out, stderr=err)
+    return PascalData(outdir, _os.path.splitext(sample_file)[0])
+
+
+###############################################################################
+#                            Comparing Two Samples                            #
+###############################################################################
+
+
+class CombinedData(object):
+
+    """Merged DataFrame representations of the outputs from comparative pascal.
+
+    Attributes
+    ----------
+    sample_1 : PascalData
+    sample_2 : PascalData
+    genescores : DataFrame
+    fgenescores : DataFrame
+    pathway : DataFrame
+    snperr : DataFrame
+    length_differences : str
+        A string describing the length differences between sample and merged
+        dataframes
+
+    Methods
+    -------
+    write(prefix, outdir)
+        Write all merged output files to outdir
+    """
+
+    sample_1    = PascalData
+    sample_2    = PascalData
+    genescores  = _pd.DataFrame
+    fgenescores = _pd.DataFrame
+    pathway     = _pd.DataFrame
+    snperr      = _pd.DataFrame
+    perms_added = False
+    diffs_done  = False
+
+    def __init__(self, directory, prefix_1=None, prefix_2=None,
+                 suffix_1=None, suffix_2=None, merge_prefix=None):
+        """Create merged data from pascal output directory.
+
+        Parameters
+        ----------
+        directory : str
+            The directory where the outputs are located
+        prefix_1 : str
+            The prefix, which comes from the name of the first input file minus
+            the file extension
+        prefix_2 : str
+            The prefix, which comes from the name of the second input file
+            minus the file extension
+        suffix_1 : str
+            A suffix to use for column names for this sample.
+        suffix_2 : str
+            A suffix to use for column names for this sample.
+        merge_prefix : str
+            A prefix to use for the merged files, defaults to the same as the
+            directory name
+        """
+        if not prefix_1 or not prefix_2:
+            if not merge_prefix or not suffix_1 or not suffix_2:
+                raise ValueError('Must provide prefices')
+        directory = _os.path.abspath(directory)
+        self.directory = directory
+        dirname = _os.path.basename(directory)
+        self.prefix = merge_prefix if merge_prefix else dirname
+        if prefix_1 and prefix_2:
+            self.sample_1 = PascalData(directory, prefix_1)
+            self.sample_2 = PascalData(directory, prefix_2)
+            self.sample_1_label = prefix_1
+            self.sample_2_label = prefix_2
+            suffix_1 = suffix_1 if suffix_1 else '{}'.format(prefix_1)
+            suffix_2 = suffix_2 if suffix_2 else '{}'.format(prefix_2)
+        if not suffix_1.startswith('_'):
+            suffix_1 = '_' + suffix_1
+        if not suffix_2.startswith('_'):
+            suffix_2 = '_' + suffix_2
+        self.suffix_1 = suffix_1
+        self.suffix_2 = suffix_2
+
+        # Make merged dataframes
+        fl = _pth(directory, self.prefix) + '.genescores.txt'
+        if _os.path.isfile(fl):
+            self.genescores = _pd.read_csv(fl, sep='\t')
+        else:
+            self.genescores = _pd.merge(
+                self.sample_1.genescores,
+                self.sample_2.genescores[['gene_id', 'numSnps',
+                                          'pvalue', 'Status']],
+                on='gene_id', suffixes=(suffix_1, suffix_2)
+            )
+        fl = _pth(directory, self.prefix) + '.fusion.genescores.txt'
+        if _os.path.isfile(fl):
+            self.fgenescores = _pd.read_csv(fl, sep='\t')
+        else:
+            self.fgenescores = _pd.merge(
+                self.sample_1.fgenescores,
+                self.sample_2.fgenescores[['gene_id', 'numSnps',
+                                           'pvalue', 'Status']],
+                on='gene_id', suffixes=(suffix_1, suffix_2)
+            )
+        fl = _pth(directory, self.prefix) + '.numSnpError.txt'
+        if _os.path.isfile(fl):
+            self.snperr = _pd.read_csv(fl, sep='\t')
+        else:
+            self.snperr = _pd.merge(
+                self.sample_1.snperr,
+                self.sample_2.snperr[['gene_id', 'SNPs']],
+                on='gene_id', suffixes=(suffix_1, suffix_2)
+            )
+        fl = _pth(directory, self.prefix) + '.PathwaySet.txt'
+        if _os.path.isfile(fl):
+            self.pathway = _pd.read_csv(fl, sep='\t')
+        else:
+            self.pathway = _pd.merge(
+                self.sample_1.pathway,
+                self.sample_2.pathway,
+                on='Name', suffixes=(suffix_1, suffix_2)
+            )
+        if 'pvalue_diff' not in self.genescores.columns:
+            self.compute_differences()
+
+    @property
+    def length_differences(self):
+        """Return a string describing the differences in length."""
+        return (
+            'Genescores\nsample_1: {}\nsample_2: {}\nmerged: {}\n'
+            'Fusion genescores\nsample_1: {}\nsample_2: {}\nmerged: {}\n'
+            'Pathway Sets\nsample_1: {}\nsample_2: {}\nmerged: {}\n'
+            'numSnpErrors\nsample_1: {}\nsample_2: {}\nmerged: {}\n'
+        ).format(
+            len(self.sample_1.genescores), len(self.sample_2.genescores),
+            len(self.genescores),
+            len(self.sample_1.fgenescores), len(self.sample_2.fgenescores),
+            len(self.fgenescores),
+            len(self.sample_1.pathway), len(self.sample_2.pathway),
+            len(self.pathway),
+            len(self.sample_1.snperr), len(self.sample_2.snperr),
+            len(self.snperr)
+        )
+
+    def compute_differences(self):
+        """Calculate the differences between pvalues in all dataframes."""
+        s1 = self.suffix_1
+        s2 = self.suffix_2
+        d = self.genescores
+        d['pvalue_diff']     = _np.abs(d['pvalue' + s1] - d['pvalue' + s2])
+        d['pvalue_log_diff'] = _np.abs(
+            _np.log10(d['pvalue' + s1]) - _np.log10(d['pvalue' + s2])
+        )
+        d['snps_diff'] = _np.abs(d['numSnps' + s1] - d['numSnps' + s2])
+        self.genescores = d
+        d = self.fgenescores
+        d['pvalue_diff']     = _np.abs(d['pvalue' + s1] - d['pvalue' + s2])
+        d['pvalue_log_diff'] = _np.abs(
+            _np.log10(d['pvalue' + s1]) - _np.log10(d['pvalue' + s2])
+        )
+        d['snps_diff'] = _np.abs(d['numSnps' + s1] - d['numSnps' + s2])
+        self.fgenescores = d
+        d = self.pathway
+        d['chi2Pvalue_diff'] = _np.abs(
+            d['chi2Pvalue' + s1] - d['chi2Pvalue' + s2]
+        )
+        d['chi2Pvalue_log_diff'] = _np.abs(
+            _np.log10(d['chi2Pvalue' + s1]) - _np.log10(d['chi2Pvalue' + s2])
+        )
+        d['empPvalue_diff'] = _np.abs(
+            d['empPvalue' + s1] - d['empPvalue' + s2]
+        )
+        d['empPvalue_log_diff'] = _np.abs(
+            _np.log10(d['empPvalue' + s1]) - _np.log10(d['empPvalue' + s2])
+        )
+        self.pathway = d
+
+    def write(self, prefix=None, outdir=None):
+        """Write all files to outdir.
+
+        Writes merged versions of all data files
+
+        Parameters
+        ----------
+        prefix : str
+            Prefix to use when writing file name, e.g. trait_merged,
+            default is <sample_1_file>_<sample_2_file>
+        outdir : str
+            Provide a path to a different directory, default is same directory
+            as the samples.
+
+        Outputs
+        -------
+        <prefix>.genescores.txt
+        <prefix>.fusion.genescores.txt
+        <prefix>.PathwaySets.txt
+        <prefix>.numSnpErrors.txt
+        """
+        outdir = outdir if outdir else self.directory
+        prefix = prefix if prefix else self.prefix
+        self.prefix = prefix
+        prefix = _pth(outdir, prefix)
+        self.genescores.to_csv(prefix + '.genescores.txt', sep='\t',
+                               index=False)
+        self.fgenescores.to_csv(prefix + '.fusion.genescores.txt', sep='\t',
+                                index=False)
+        self.pathway.to_csv(prefix + '.PathwaySet.txt', sep='\t', index=False)
+        self.snperr.to_csv(prefix + '.numSnpError.txt', sep='\t', index=False)
+
+    def add_perms(self, perm_dir=None, prefix=None):
+        """Create new dataframes of permuted data.
+
+        genescores, fgenescores, and pathway permuted dataframes are added,
+        same columns as originals, but with one additional column: 'perm',
+        which gives the permutation count
+
+        Parameters
+        ----------
+        perm_dir : str
+            Path to directory with permutations, default is our directory.
+        prefix : str
+            Prefix for merged perm files, default is our merged prefix
+
+        Returns
+        -------
+        data : dict
+            Dictionary of MWU objects
+        """
+        if not perm_dir:
+            perm_dir = self.directory
+        perm_dir = _os.path.abspath(perm_dir)
+        prefix = prefix if prefix else self.prefix
+        perm_genescores  = []
+        perm_fgenescores = []
+        perm_pathway     = []
+        self.perm_count  = 0
+        for pdir in [_pth(perm_dir, f) for f in _os.listdir(perm_dir)]:
+            if not '_perm_' in _os.path.basename(pdir):
+                continue
+            if not _os.path.isdir(pdir):
+                continue
+            try:
+                perm = int(pdir.split('_')[-1])
+                perm_prefix ='{}_perm_{}'.format(prefix, perm)
+            except ValueError:
+                continue
+            try:
+                data = CombinedData(
+                    pdir, merge_prefix=perm_prefix,
+                    suffix_1=self.suffix_1, suffix_2=self.suffix_2
+                )
+            except:
+                continue
+            data.genescores['perm'] = perm
+            cols = ['gene_symbol', 'pvalue_diff', 'pvalue_log_diff',
+                    'snps_diff', 'perm']
+            perm_genescores.append(data.genescores[cols].rename(
+                columns={i: 'perm_' + i for i in cols[1:-1]}
+            ))
+            data.fgenescores['perm'] = perm
+            perm_fgenescores.append(data.fgenescores[cols].rename(
+                columns={i: 'perm_' + i for i in cols[1:-1]}
+            ))
+            data.pathway['perm'] = perm
+            cols = ['Name', 'chi2Pvalue_diff', 'chi2Pvalue_log_diff',
+                    'empPvalue_diff', 'empPvalue_log_diff', 'perm']
+            perm_pathway.append(data.pathway[cols].rename(
+                columns={i: 'perm_' + i for i in cols[1:-1]}
+            ))
+            self.perm_count += 1
+        if self.perm_count >= 1:
+            self.perm_genescores  = _pd.concat(perm_genescores)
+            self.perm_fgenescores = _pd.concat(perm_fgenescores)
+            self.perm_pathway     = _pd.concat(perm_pathway)
+            self.perms_added = True
+        else:
+            _sys.stderr.write('No permutations completed yet')
+
+    def compare_to_perms(self):
+        """Get mannwhitney U for all pvalue differences to perm.
+
+        Also adds minimum pvalue column to every dataframe.
+        """
+        summary = self.perm_genescores.groupby('gene_symbol').agg(
+            {'perm_pvalue_diff': _np.min,
+             'perm_pvalue_log_diff': _np.max,
+             'perm_snps_diff': _np.max,
+             'perm': _np.count_nonzero}
+        ).reset_index()
+        self.genescores_mwu = _sts.mannwhitneyu(
+            self.genescores.pvalue_log_diff,
+            self.perm_genescores.perm_pvalue_log_diff
+        )
+        self.genescores = _pd.merge(
+            self.genescores, summary, how='left', on='gene_symbol'
+        )
+        summary = self.perm_fgenescores.groupby('gene_symbol').agg(
+            {'perm_pvalue_diff': _np.min,
+             'perm_pvalue_log_diff': _np.max,
+             'perm_snps_diff': _np.max,
+             'perm': _np.count_nonzero}
+        ).reset_index()
+        self.fgenescores_mwu = _sts.mannwhitneyu(
+            self.fgenescores.pvalue_log_diff,
+            self.perm_fgenescores.perm_pvalue_log_diff
+        )
+        self.fgenescores = _pd.merge(
+            self.fgenescores, summary, how='left', on='gene_symbol'
+        )
+        summary = self.perm_pathway.groupby('Name').agg(
+            {'perm_chi2Pvalue_diff': _np.min,
+             'perm_chi2Pvalue_log_diff': _np.max,
+             'perm_empPvalue_diff': _np.min,
+             'perm_empPvalue_log_diff': _np.max,
+             'perm': _np.count_nonzero}
+        ).reset_index()
+        self.pathway_chi2_mwu = _sts.mannwhitneyu(
+            self.pathway.chi2Pvalue_log_diff,
+            self.perm_pathway.perm_chi2Pvalue_log_diff
+        )
+        self.pathway_emp_mwu = _sts.mannwhitneyu(
+            self.pathway.empPvalue_log_diff,
+            self.perm_pathway.perm_empPvalue_log_diff
+        )
+        self.pathway = _pd.merge(
+            self.pathway, summary, how='left', on='Name'
+        )
+        self.genescores['beats_perm'] = (
+            self.genescores.pvalue_log_diff >
+            self.genescores.perm_pvalue_log_diff
+        )
+        self.fgenescores['beats_perm'] = (
+            self.fgenescores.pvalue_log_diff >
+            self.fgenescores.perm_pvalue_log_diff
+        )
+        self.pathway['beats_perm_chi2'] = (
+            self.pathway.chi2Pvalue_log_diff >
+            self.pathway.perm_chi2Pvalue_log_diff
+        )
+        self.pathway['beats_perm_emp'] = (
+            self.pathway.empPvalue_log_diff >
+            self.pathway.perm_empPvalue_log_diff
+        )
+        self.diffs_done = True
+
+    def plot(self, table, modifier=None, xlabel=None, ylabel=None, title=None,
+             write_to=None):
+        """Plot a -log10 pvalue scatter graph for the given table.
+
+        Permutation information is included if pre-computed.
+
+        Parameters
+        ----------
+        table : str
+            One of 'genescores', 'fgenescores', or 'pathway'
+        modifier : str
+            If table is 'pathway' one of 'chi2' or 'emp'
+        xlabel, ylabel, title : str
+            Optional labels for the plot, defaults to existing labels
+        write_to : str
+            Path to a png, jpg, or pdf file to save the image
+
+        Returns
+        -------
+        fig, axes
+        """
+        if not _plots:
+            raise ImportError('Need plots to function')
+        if not table in ['genescores', 'fgenescores', 'pathway']:
+            raise ValueError('invalid table name')
+        if table == 'pathway':
+            if not modifier or modifier not in ['chi2', 'emp']:
+                raise ValueError('invalid modifier')
+            pval1 = '{}Pvalue{}'.format(modifier, self.suffix_1)
+            pval2 = '{}Pvalue{}'.format(modifier, self.suffix_2)
+            bp  = 'beats_perm_{}'.format(modifier)
+            mwu = getattr(self, '{}_{}_mwu'.format(table, modifier))
+        else:
+            pval1 = 'pvalue{}'.format(self.suffix_1)
+            pval2 = 'pvalue{}'.format(self.suffix_2)
+            bp  = 'beats_perm'
+            mwu = getattr(self, '{}_mwu'.format(table))
+        df = getattr(self, table)
+        df = df.dropna(subset=[pval1, pval2])
+
+        xlabel = xlabel if xlabel else self.suffix_1.strip('_')
+        ylabel = ylabel if ylabel else self.suffix_2.strip('_')
+        title  = title if title else _os.path.basename(self.directory)
+
+        kwargs = dict(
+            x=df[pval1], y=df[pval2], xlabel=xlabel, ylabel=ylabel,
+            pval=0.05, title=title, log_scale='negative',
+            reg_details=False
+        )
+
+        if self.diffs_done:
+            kwargs.update(dict(
+                highlight=df[bp],
+                highlight_label='Beats {} Permutations'.format(self.perm_count),
+                add_text='MWU P: {:.3}'.format(mwu.pvalue)
+            ))
+
+        f, a = _plots.scatter(**kwargs)
+
+        return f, a
+
+
+def run_pascal_comp(sample_1, sample_2, outdir='.', merge_prefix=None,
+                    sample_1_label='sample_1', sample_2_label='sample_2',
+                    parallel=True, verbose=False, **pascalargs):
+    """Run pascal twice and compare the outputs.
+
+    Runs pascal twice in parallel with multiprocessing.
+
+    Parameters
+    ----------
+    sample_1 : str
+        File name or path to file with rsids and pvals for sample 1
+    sample_2 : str
+        File name or path to file with rsids and pvals for sample 2
+    outdir : str
+        Directory to write the outputs to
+    merge_prefix : str
+        Prefix to use when writing merged file names, e.g. trait_merged,
+        default is <sample_1_file>_<sample_2_file>
+    sample_1_label : str
+        Label used for columns for this sample (e.g. pvalue becomes
+        pvalue_sample_1)
+    sample_2_label : str
+        Label used for columns for this sample
+    parallel : bool
+    verbose : bool
+    pascalargs : keywords
+        Any arguments for pascal (see all with
+        argument_parser(get_pascal_args=True))
+
+    Outputs
+    -------
+    All pascal outputs plus:
+    <outdir>/<merge_prefix>.genescores.txt
+    <outdir>/<merge_prefix>.fusion.genescores.txt
+    <outdir>/<merge_prefix>.PathwaySets.txt
+    <outdir>/<merge_prefix>.numSnpErrors.txt
+
+    Raises
+    ------
+    _sub.CalledProcessError
+        If either pascal job fails
+
+    Returns
+    -------
+    CombinedData
+        A CombinedData object containing all merged and sample DataFrames
+    """
+    assert _os.path.isfile(sample_1)
+    assert _os.path.isfile(sample_2)
+    if not _os.path.isdir(outdir):
+        _os.makedirs(outdir)
+    outdir = _os.path.abspath(outdir)
+    print(outdir)
+    pascalargs.update(dict(outdir=outdir))
+
+    # Run jobs
+    if parallel:
+        with _mp.Pool(2) as pool:
+            job1 = pool.apply_async(run_pascal, (sample_1,), kwds=pascalargs)
+            job2 = pool.apply_async(run_pascal, (sample_2,), kwds=pascalargs)
+            out1, err1, code1 = job1.get()
+            out2, err2, code2 = job2.get()
+    else:
+        out1, err1, code1 = run_pascal(sample_1, **pascalargs)
+        out2, err2, code2 = run_pascal(sample_2, **pascalargs)
+
+    # Check run status
+    failed_1 = False
+    failed_2 = False
+    if code1 != 0:
+        _sys.stderr.write('Pascal {} job failed.\nSTDOUT:\n{}STDERR:{}\n'
+                          .format(sample_1, out1, err1))
+        failed_1 = True
+    if code2 != 0:
+        _sys.stderr.write('Pascal {} job failed.\nSTDOUT:\n{}STDERR:{}\n'
+                          .format(sample_2, out2, err2))
+        failed_2 = True
+    if failed_1 and failed_2:
+        raise _sub.CalledProcessError(code1, 'both pascal jobs')
+    elif failed_1:
+        raise _sub.CalledProcessError(code1, 'pascal {} job'
+                                      .format(sample_1))
+    elif failed_2:
+        raise _sub.CalledProcessError(code2, 'pascal {} job'
+                                      .format(sample_2))
+
+    # Parse Outputs
+    prefix_1 = _os.path.basename(_os.path.splitext(sample_1)[0])
+    prefix_2 = _os.path.basename(_os.path.splitext(sample_2)[0])
+    print(outdir, prefix_1, prefix_2)
+    data = CombinedData(outdir, prefix_1, prefix_2,
+                        sample_1_label, sample_2_label)
+    if verbose:
+        _sys.stderr.write('{} v {} lengths\n'.format(sample_1, sample_2))
+        _sys.stderr.write(data.length_differences)
+    data.write(prefix=merge_prefix, outdir=outdir)
+
+    return data
+
+
+def plot_comparisons(data, folder=None, tables=None):
+    """Write png plots to a folder.
+
+    Parameters
+    ----------
+    data : CombinedData
+    folder : str
+        Directory to write to defaults to same directory as data
+    tables : list
+        A list of any of ['genescores', 'fgenescores', 'pathway_chi2'
+        'pathway_emp'] to plot, defaults to all.
+    """
+    folder = _os.path.abspath(folder) if folder else data.directory
+    assert _os.path.isdir(folder)
+    default_tables = [
+        'genescores', 'fgenescores', 'pathway_chi2', 'pathway_emp'
+    ]
+    tables = tables if tables else default_tables
+    if isinstance(tables, str):
+        tables = [tables]
+    for t in tables:
+        if t not in default_tables:
+            raise ValueError('Invalid table {}'.format(t))
+
+    prefix = _pth(folder, data.prefix)
+    name = _os.path.basename(data.directory)
+    if 'genescores' in tables:
+        data.plot(
+            'genescores', title=name + ' Genescores',
+            write_to='{}.genescores.png'.format(prefix)
+        )
+    if 'fgenescores' in tables:
+        data.plot(
+            'fgenescores', title=name + ' Fusion Genescores',
+            write_to='{}.fusion.genescores.png'.format(prefix)
+        )
+    if 'pathway_chi2' in tables:
+        data.plot(
+            'pathway', modifier='chi2',
+            title=name + ' Pathway Chi2',
+            write_to='{}.fusion.genescores.png'.format(prefix)
+        )
+    if 'pathway_emp' in tables:
+        data.plot(
+            'pathway', modifier='emp',
+            title=name + ' Pathway emp',
+            write_to='{}.fusion.genescores.png'.format(prefix)
+        )
+
+
+###############################################################################
+#                                Permutations                                 #
+###############################################################################
+
+
+def run_permutation(sample_1, sample_2, outdir, perms=1000,
+                    sample_1_label='sample_1', sample_2_label='sample_2',
+                    mem_per_job='8G', wait=True, start_perms=None,
+                    fyrd_args=None, **pascalargs):
+    """Permute data from two sample sets and run pascal on each combination.
+
+    This function uses fyrd to submit cluster jobs.
+
+    Method: Combine all data from sample_1 and sample_2 into a single list,
+    then permute that list with numpy and split is into two new lists of the
+    same lengths as sample_1 and sample_2. Then run depict as normal on those
+    two files.
+
+    Parameters
+    ----------
+    sample_1 : str
+        File name or path to file with rsids and pvals for sample 1
+    sample_2 : str
+        File name or path to file with rsids and pvals for sample 2
+    perms : int
+        Number of permutations.
+    mem_per_job : str
+        Amount of memory to request for each job
+    wait : bool
+        Wait for jobs to finish before returning
+    start_perms : int
+        Start permutation count from this number
+    fyrd_args : dict
+        Fyrd keyword arguments, not required.
+    pascalargs : keywords
+        Any arguments for pascal (see all with
+        argument_parser(get_pascal_args=True))
+    """
+    if not _np:
+        raise ImportError('Cannot run permutations without numpy')
+    if not _pd:
+        raise ImportError('Cannot run comparison without pandas')
+    if not _fyrd:
+        _sys.stderr.write('Fyrd is not installed, running all permutations '
+                          'locally\n')
+        raise ImportError('Local run not enabled.')
+
+    # Read files into two lists and combine into one 'super' list
+    s1_rsids = []
+    s2_rsids = []
+    with open(sample_1) as fin:
+        s1_rsids += fin.read().strip().split('\n')
+    with open(sample_2) as fin:
+        s2_rsids += fin.read().strip().split('\n')
+    rsids = _np.array(s1_rsids + s2_rsids)
+
+    # Make sure a minimum reasonable walltime is set
+    if not isinstance(fyrd_args, dict):
+        fyrd_args = dict()
+    if 'walltime' not in fyrd_args and 'time' not in fyrd_args:
+        fyrd_args.update(time='00:15:00')
+
+    # Prep for permutations
+    outdir    = _os.path.abspath(outdir)
+    perm_path = _pth(outdir, 'perm_files')
+    job_path  = _pth(outdir, 'jobs')
+    if not _os.path.isdir(perm_path):
+        _os.mkdir(perm_path)
+    if not _os.path.isdir(job_path):
+        _os.mkdir(job_path)
+    #  if not _fyrd:
+        #  pool = _mp.Pool()
+    ttl = perms
+    if _pb:
+        pbar = _pb(total=ttl, unit='perms')
+
+    jobs  = {}
+    if start_perms:
+        perm = int(start_perms)
+    else:
+        done_perms = []
+        for fl in _os.listdir(outdir):
+            if fl.startswith(_os.path.basename(outdir + '_perm_')):
+                try:
+                    done_perms.append(int(fl.split('_')[-1]))
+                except ValueError:
+                    raise
+        perm = max(done_perms)+1 if done_perms else 1
+
+    print('Running {} permutations starting at {}'.format(perms, perm))
+    while perms:
+        # Permute data
+        this_perm = _np.random.permutation(rsids)
+        new_sample_1_data = sorted(this_perm[:len(s1_rsids)])
+        new_sample_2_data = sorted(this_perm[len(s1_rsids):])
+        assert len(new_sample_1_data) == len(s1_rsids)
+        assert len(new_sample_2_data) == len(s2_rsids)
+
+        # Create the permutation files
+        new_sample_1 = _pth(
+            _os.path.abspath(perm_path),
+            _os.path.basename(sample_1) + '_perm_{}.txt'.format(perm)
+        )
+        new_sample_2 = _pth(
+            _os.path.abspath(perm_path),
+            _os.path.basename(sample_2) + '_perm_{}.txt'.format(perm)
+        )
+        with open(new_sample_1, 'w') as fout:
+            fout.write('\n'.join(new_sample_1_data))
+        with open(new_sample_2, 'w') as fout:
+            fout.write('\n'.join(new_sample_2_data))
+
+        name       = '{}_perm_{}'.format(_os.path.basename(outdir), perm)
+        new_outdir = _pth(outdir, name)
+
+        # Build job arguments
+        kwargs  = dict(sample_1       = new_sample_1,
+                       sample_2       = new_sample_2,
+                       outdir         = new_outdir,
+                       merge_prefix   = name,
+                       sample_1_label = sample_1_label,
+                       sample_2_label = sample_2_label)
+        if pascalargs:
+            kwargs.update(pascalargs)
+
+        # Actually submit the job
+        jobs[name] = (
+            _fyrd.submit(
+                run_pascal_comp,
+                kwargs     = kwargs,
+                name       = name,
+                syspaths   = _os.path.split(_os.path.realpath(__file__))[0],
+                imports    = ['import os as _os', 'import sys as _sys',
+                              'from _os.path import join as _pth',
+                              'import subprocess as _sub',
+                              'import multiprocessing as _mp',
+                              'import pascal', 'from pascal import *',
+                              'from pascal import _run',
+                              'from pascal import PascalData',
+                              'from pascal import CombinedData',
+                              'from pascal import get_pascal_arg_string',
+                              'from pascal import get_runtime_info',
+                              'from pascal import run_pascal',],
+                cores      = 2,
+                mem        = mem_per_job,
+                scriptpath = job_path,
+                outpath    = new_outdir,
+                **fyrd_args
+            )
+        )
+        perms -= 1
+        perm  += 1
+        pbar.update()
+    pbar.close()
+
+    if not wait:
+        return
+
+    # Get output file information
+    print('Permutation jobs submitted, waiting for results.')
+    outputs = {}
+    with _pb(total=ttl, unit='results') as pbar:
+        while len(outputs) < len(jobs):
+            for name, job in jobs.items():
+                if name in outputs:
+                    continue
+                job.update()
+                if job.done:
+                    outs = job.get()
+                    outputs[name] = outs
+                    pbar.update()
+            _sleep(1)
+
+    print('Permutation jobs completed.')
+
+    return outputs
+
+
+def analyse_comparison(sample_1, sample_2, outdir, perms=1000,
+                       sample_1_label='sample_1', sample_2_label='sample_2',
+                       mem_per_job='8G', start_perms=None,
+                       fyrd_args=None, **pascalargs):
+    """Run the complete analysis pipeline.
+
+    Will run:
+        - initial comparison
+        - permutations
+        - permutation parsing
+        - plotting
+
+    Parameters
+    ----------
+    sample_1 : str
+        File name or path to file with rsids and pvals for sample 1
+    sample_2 : str
+        File name or path to file with rsids and pvals for sample 2
+    perms : int
+        Number of permutations.
+    mem_per_job : str
+        Amount of memory to request for each job
+    start_perms : int
+        Start permutation count from this number
+    fyrd_args : dict
+        Fyrd keyword arguments, not required.
+    pascalargs : keywords
+        Any arguments for pascal (see all with
+        argument_parser(get_pascal_args=True))
+
+    Returns
+    -------
+    CombinedData
+    """
+    if not _np:
+        raise ImportError('Cannot run permutations without numpy')
+    if not _pd:
+        raise ImportError('Cannot run comparison without pandas')
+    if not _fyrd:
+        _sys.stderr.write('Fyrd is not installed, running all permutations '
+                          'locally\n')
+        raise ImportError('Local run not enabled.')
+
+    # Make sure a minimum reasonable walltime is set
+    if not isinstance(fyrd_args, dict):
+        fyrd_args = dict()
+    if 'walltime' not in fyrd_args and 'time' not in fyrd_args:
+        fyrd_args.update(time='00:15:00')
+
+    outdir   = _os.path.abspath(outdir)
+    if not _os.path.isdir(outdir):
+        _os.makedirs(outdir)
+    job_path = _pth(outdir, 'jobs')
+    if not _os.path.isdir(job_path):
+        _os.makedirs(job_path)
+
+    print('Submitting main comparison to cluster.')
+    main_job = _fyrd.submit(
+        run_pascal_comp,
+        kwargs=dict(
+            sample_1=sample_1, sample_2=sample_2, outdir=outdir,
+            sample_1_label=sample_1_label, sample_2_label=sample_2_label,
+            parallel=True, **pascalargs
+        ),
+        syspaths   = _os.path.split(_os.path.realpath(__file__))[0],
+        imports    = ['import os as _os', 'import sys as _sys',
+                      'from _os.path import join as _pth',
+                      'import subprocess as _sub',
+                      'import multiprocessing as _mp',
+                      'import pascal', 'from pascal import *',
+                      'from pascal import _run',
+                      'from pascal import PascalData',
+                      'from pascal import CombinedData',
+                      'from pascal import get_pascal_arg_string',
+                      'from pascal import get_runtime_info',
+                      'from pascal import run_pascal',],
+        cores      = 2,
+        mem        = mem_per_job,
+        scriptpath = job_path,
+        outpath    = outdir,
+        **fyrd_args
+    )
+
+    # Will wait for permutations
+    if 'wait' in pascalargs:
+        pascalargs.pop('wait')
+    run_permutation(sample_1, sample_2, outdir, perms=perms,
+                    sample_1_label=sample_1_label,
+                    sample_2_label=sample_2_label,
+                    mem_per_job=mem_per_job, wait=True,
+                    start_perms=start_perms, fyrd_args=fyrd_args,
+                    **pascalargs)
+
+    # Get main job
+    print('Getting main job')
+    data = main_job.get()
+
+    # Analyze permutations
+    print('Analyzing permutations')
+    data.add_perms()
+    data.compare_to_perms()
+
+    # Plot
+    print('Plotting')
+    plot_comparisons(data)
+
+    print('Done')
+
+    return data
+
+
+def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
+                       suffix_1=None, suffix_2=None, merge_prefix=None):
+    """Build data object from pre-completed comparison and permutations.
+
+    Parameters
+    ----------
+    directory : str
+        The directory where the outputs are located
+    prefix_1 : str
+        The prefix, which comes from the name of the first input file minus
+        the file extension
+    prefix_2 : str
+        The prefix, which comes from the name of the second input file
+        minus the file extension
+    perm_dir : str, optional
+        Only provide if the permutation directory is different
+    suffix_1 : str, optional
+        A suffix to use for column names for this sample.
+    suffix_2 : str, optional
+        A suffix to use for column names for this sample.
+    merge_prefix : str, optional
+        A prefix to use for the merged files, defaults to the same as the
+        directory name
+
+    Returns
+    -------
+    CombinedData
+    """
+    data = CombinedData(directory, prefix_1, prefix_2, suffix_1, suffix_2)
+    data.add_perms(perm_dir=perm_dir, prefix=merge_prefix)
+    data.compare_to_perms()
+    return data
 
 
 ###############################################################################
@@ -57,7 +1091,8 @@ def run_pascal(sample_file, **kwargs):
 def get_pascal_arg_string(sample_file, **kwargs):
     """Take all keyword arguments and return an argument string for pascal."""
     allowed_args = ['chr', 'up', 'down', 'maxsnp', 'outsuffix', 'custom',
-                    'mergeddistance', 'mafcutoff', 'genesetfile', 'customdir']
+                    'mergeddistance', 'mafcutoff', 'genesetfile', 'customdir',
+                    'set', 'randseed']
     argstr = '--pval={} '.format(_os.path.abspath(sample_file))
 
     # Handle outdir parsing
@@ -65,6 +1100,11 @@ def get_pascal_arg_string(sample_file, **kwargs):
         #  outdir = _os.path.basename(kwargs.pop('outdir'))
         outdir = _os.path.abspath(kwargs.pop('outdir'))
         argstr += '--outdir={} '.format(outdir)
+
+    # Settings file
+    if 'settings' in kwargs:
+        settings = kwargs.pop('settings')
+        kwargs.update(dict(set=settings))
 
     # Gene Scoring Method
     if 'genescoring' in kwargs:
@@ -96,6 +1136,35 @@ def get_pascal_arg_string(sample_file, **kwargs):
             _sys.stderr.write('Ignoring unrecognized argument --{}\n'
                               .format(k))
     return argstr
+
+
+def create_pascal_infile(sample, file_name):
+    """Create an input file for pascal.
+
+    Parameters
+    ----------
+    sample : list_or_DataFrame
+        A list of rsIDs and pvalues either as a two column DataFrame or a
+        list of tuples.
+    file_name : str
+        Valid path to non-existing file with write permission
+
+    Returns
+    -------
+    path : str
+    """
+    if not _pd:
+        raise ImportError('cannot parse pascal output without pandas')
+    if not isinstance(sample, _pd.core.frame.DataFrame):
+        sample = list(sample)
+        if not isinstance(sample[0], tuple):
+            raise ValueError(
+                'Sample must be a 2 column DataFrame or list of tuples'
+            )
+        sample = _pd.DataFrame(sample)
+        sample = sample[[sample.columns[0], sample.columns[1]]]
+    sample.to_csv(file_name, header=False, index=False)
+    return file_name
 
 
 def get_runtime_info():
@@ -167,8 +1236,11 @@ def _run(command, raise_on_error=False):
 ###############################################################################
 
 
-def argument_parser():
-    """Parse all arguments."""
+def argument_parser(get_pascal_args=False):
+    """Build an argument parser for command line running.
+
+    get_pascal_args prompts the return of a formatted string of pascal options.
+    """
     path, _ = get_runtime_info()
     parser = _argparse.ArgumentParser(
         description=__doc__,
@@ -178,15 +1250,28 @@ def argument_parser():
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show debug output')
 
-    # Universal arguments
-    shared = _argparse.ArgumentParser(add_help=False)
-    shared.add_argument('-o', '--outdir',
-                        help='Directory to output files to')
-    shared.add_argument('--outsuffix',
-                        help=(
-                            'Adds an additional string to the output file '
-                            'names produced.'
-                        ))
+    ############################################
+    #  Shared parser for all pascal arguments  #
+    ############################################
+
+    shared_parent = _argparse.ArgumentParser(add_help=False)
+    shared_parent.add_argument('-o', '--outdir',
+                               help='Directory to output files to')
+    shared_parent.add_argument('--outsuffix',
+                               help=(
+                                   'Adds an additional string to the output file '
+                                   'names produced.'
+                               ))
+
+    shared = shared_parent.add_argument_group(
+        'pascal runtime arguments'
+    )
+    shared.add_argument('--settings',
+                        default = _os.path.join(
+                            path, 'settings.txt'
+                        ), help='Settings file with default pascal settings.')
+    shared.add_argument('--randseed', type=int, default=_randint(1, 999999999),
+                        help='set a random seed')
     shared.add_argument('--chr', type=int, help='limit to this chromosome')
     shared.add_argument('--up', type=int, default=50000,
                         help=(
@@ -245,7 +1330,7 @@ def argument_parser():
                             'msigBIOCARTA_KEGG_REACTOME.gmt'
                         ))
 
-    cref = shared.add_argument_group(
+    cref = shared_parent.add_argument_group(
         'custom reference',
         description=(
             'Pascal allows to use custom reference populations instead of the '
@@ -269,14 +1354,112 @@ def argument_parser():
                           '<prefix>.chr<chrNr>.tped.gz.'
                       ))
 
+    # Return just the pascal args if desired
+    if get_pascal_args:
+        return shared_parent.format_help()
+
+    #######################################
+    #  Shared Parser For Cluster Running  #
+    #######################################
+
+    shared_cluster = _argparse.ArgumentParser(add_help=False)
+    cluster = shared_cluster.add_argument_group(
+        'cluster running options',
+        description="Options for cluster jobs when running with fyrd."
+    )
+    cluster.add_argument('--walltime', default='00:20:00',
+                         help='Amount of time to request per permutation ' +
+                         '(cluster running only)')
+    cluster.add_argument('--queue',
+                         help='Queue to run jobs in (cluster running only)')
+    cluster.add_argument('--profile',
+                         help='Fyrd profile to use (cluster running only)')
+    cluster.add_argument('--keep-job-files', action='store_false',
+                         help='Do not delete job files (cluster running only)')
+
+    ##################################################
+    #  Define Run modes, independent of pascal args  #
+    ##################################################
+
     modes = parser.add_subparsers(title='mode', dest='mode')
 
     # Run simply with only one sample
     single = modes.add_parser(
-        'single', parents=[shared],
+        'single', parents=[shared_parent],
         help="Run pascal directly on a single dataset"
     )
     single.add_argument('snp_file', help='File of rsid\\tpval to analyze')
+
+    # Run a simple comparison
+    double = modes.add_parser(
+        'double', parents=[shared_parent],
+        help="Run pascal on two datasets and created merge comparison files." +
+        " Runs in parallel with two cores."
+    )
+    double.add_argument('sample_1', help='File of rsid\\tpval to analyze')
+    double.add_argument('sample_2', help='File of rsid\\tpval to analyze')
+    double.add_argument('--s1-label', default='sample_1',
+                        help='A label to use for sample_1')
+    double.add_argument('--s2-label', default='sample_2',
+                        help='A label to use for sample_2')
+    double.add_argument('--prefix',
+                        help="A prefix to use for merged file names.")
+
+    # Run permutations only
+    perms = modes.add_parser(
+        'permute', parents=[shared_cluster, shared_parent],
+        help="Run pascal permutations, randomizes contents of two samples " +
+        "and runs pascal on each. Defaults to use a cluster with the fyrd " +
+        "module. Each permutation should take around 2 minutes and 8G of " +
+        "memory. If fyrd is not installed, local threads are used."
+    )
+    perms.add_argument('sample_1', help='File of rsid\\tpval to analyze')
+    perms.add_argument('sample_2', help='File of rsid\\tpval to analyze')
+    perms.add_argument('--s1-label', default='sample_1',
+                       help='A label to use for sample_1')
+    perms.add_argument('--s2-label', default='sample_2',
+                       help='A label to use for sample_2')
+    perms.add_argument('--perms', default=1000, type=int,
+                       help='Number of permutations to run')
+    perms.add_argument('--no-wait', action='store_false',
+                       help='Do not wait for permutations to finish')
+    perms.add_argument('--mem', default='8G',
+                       help='Amount of memory to request per permutation')
+    perms.add_argument('--start-at', type=int,
+                       help='Start from permutation #')
+
+    # Run permutations only
+    analyze = modes.add_parser(
+        'analyze', parents=[shared_cluster, shared_parent],
+        help="Runs a complete analysis on the cluster, including the main " +
+        "analysis, permutations, and plotting. Plotting is done locally."
+    )
+    analyze.add_argument('sample_1', help='File of rsid\\tpval to analyze')
+    analyze.add_argument('sample_2', help='File of rsid\\tpval to analyze')
+    analyze.add_argument('--s1-label', default='sample_1',
+                         help='A label to use for sample_1')
+    analyze.add_argument('--s2-label', default='sample_2',
+                         help='A label to use for sample_2')
+    analyze.add_argument('--perms', default=1000, type=int,
+                         help='Number of permutations to run')
+    analyze.add_argument('--no-wait', action='store_false',
+                         help='Do not wait for permutations to finish')
+    analyze.add_argument('--mem', default='8G',
+                         help='Amount of memory to request per permutation')
+    analyze.add_argument('--start-at', type=int,
+                         help='Start from permutation #')
+
+    # Write Plots
+    plot = modes.add_parser(
+        'plot',
+        help="Create scatter plots of exiting data."
+    )
+    plot.add_argument('sample_1', help='File of rsid\\tpval analyzed')
+    plot.add_argument('sample_2', help='File of rsid\\tpval analyzed')
+    plot.add_argument('--s1-label', default='sample_1',
+                      help='A label to use for sample_1')
+    plot.add_argument('--s2-label', default='sample_2',
+                      help='A label to use for sample_2')
 
     return parser
 
@@ -307,22 +1490,91 @@ def main(argv=None):
     opts = vars(args)
     if VERBOSE:
         print(opts)
+    settings = _os.path.abspath(opts.pop('settings'))
+    opts.update(dict(set=settings))
 
     outdir = args.outdir
     outdir = _os.path.abspath(outdir if outdir.strip() else _os.curdir)
     mode = opts.pop('mode')
     if mode == 'single':
         sample_file = opts.pop('snp_file')
-        name = _os.path.join(
-            outdir,
-            _os.path.splitext(_os.path.basename(sample_file))[0]
-        )
-        out, err, code = run_pascal(sample_file, **opts)
-        with open(name + '.out', 'w') as fout:
-            fout.write(out)
-        with open(name + '.err', 'w') as fout:
-            fout.write(err)
-        _sys.exit(code)
+        code = run_pascal(sample_file, **opts)[3]
+        return code
+    elif mode == 'double':
+        sample_1 = opts.pop('sample_1')
+        sample_2 = opts.pop('sample_2')
+        sample_1_label = opts.pop('s1_label')
+        sample_2_label = opts.pop('s2_label')
+        merge_prefix = opts.pop('prefix')
+        if not merge_prefix:
+            merge_prefix = _os.path.basename(outdir)
+        run_pascal_comp(sample_1, sample_2,
+                        merge_prefix=merge_prefix,
+                        sample_1_label=sample_1_label,
+                        sample_2_label=sample_2_label,
+                        **opts)
+        return 0
+    elif mode == 'permute':
+        sample_1 = opts.pop('sample_1')
+        sample_2 = opts.pop('sample_2')
+        sample_1_label = opts.pop('s1_label')
+        sample_2_label = opts.pop('s2_label')
+        wait = opts.pop('no_wait')
+        perms = opts.pop('perms')
+        startat = opts.pop('start_at')
+        mem = opts.pop('mem')
+        time = opts.pop('walltime')
+        queue = opts.pop('queue')
+        profile = opts.pop('profile')
+        fyrd_args = dict(time=time)
+        if queue:
+            fyrd_args.update(dict(partition=queue))
+        if profile:
+            fyrd_args.update(dict(profile=profile))
+        fyrd_args.update(dict(clean_files=False, clean_outputs=False))
+        opts.pop('outdir')
+        run_permutation(sample_1, sample_2, outdir, perms=perms,
+                        sample_1_label=sample_1_label,
+                        sample_2_label=sample_2_label,
+                        mem_per_job=mem, wait=wait,
+                        start_perms=startat, fyrd_args=fyrd_args,
+                        **opts)
+        return 0
+    elif mode == 'analyze':
+        sample_1 = opts.pop('sample_1')
+        sample_2 = opts.pop('sample_2')
+        sample_1_label = opts.pop('s1_label')
+        sample_2_label = opts.pop('s2_label')
+        wait = opts.pop('no_wait')
+        perms = opts.pop('perms')
+        startat = opts.pop('start_at')
+        mem = opts.pop('mem')
+        time = opts.pop('walltime')
+        queue = opts.pop('queue')
+        profile = opts.pop('profile')
+        fyrd_args = dict(time=time)
+        if queue:
+            fyrd_args.update(dict(partition=queue))
+        if profile:
+            fyrd_args.update(dict(profile=profile))
+        fyrd_args.update(dict(clean_files=False, clean_outputs=False))
+        opts.pop('outdir')
+        analyse_comparison(sample_1, sample_2, outdir, perms=perms,
+                           sample_1_label=sample_1_label,
+                           sample_2_label=sample_2_label,
+                           mem_per_job=mem, wait=wait,
+                           start_perms=startat, fyrd_args=fyrd_args,
+                           **opts)
+        return 0
+    elif mode == 'plot':
+        sample_1 = opts.pop('sample_1')
+        sample_2 = opts.pop('sample_2')
+        sample_1_label = opts.pop('s1_label')
+        sample_2_label = opts.pop('s2_label')
+        prefix_1 = _os.path.splitext(_os.path.basename(sample_1))[0]
+        prefix_2 = _os.path.splitext(_os.path.basename(sample_2))[0]
+        data = get_completed_data(outdir, prefix_1, prefix_2)
+        plot_comparisons(data)
 
 
 if __name__ == '__main__' and '__file__' in globals():
