@@ -12,9 +12,9 @@
 # VARIOUS
 
 # Seed for the random number generator, set to -1 to use current time
-randomSeed = 2
+randomSeed = -1
 # Default output directory to save files (empty = home directory; '.' = working directory)
-outputDirectory = output
+outputDirectory = '.'
 # A suffix that is appended to all output files for this run (use to distinguish output files from multiple runs)
 outputSuffix = 
 # Compress output files (gzip)
@@ -111,7 +111,7 @@ multipleOfPhenotype=1
 
 
 # Max number of snps per gene (display warning and ignore genes with more snps; set to -1 to not use a limit)
-maxSnpsPerGene = 3000
+maxSnpsPerGene = -1
 # only use snps that have maf above this value in refererence population 
 useMafCutoff = 0.05
 

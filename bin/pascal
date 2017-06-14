@@ -13,6 +13,10 @@ import argparse as _argparse
 import multiprocessing as _mp
 from random import randint as _randint
 
+# Get rid of pandas future warnings
+import warnings as _warn
+_warn.simplefilter(action='ignore', category=FutureWarning)
+
 # For analysis
 try:
     import pandas as _pd
@@ -54,6 +58,44 @@ except ImportError:
     _fyrd = None
 
 VERBOSE = False  # Show debug output
+
+###############################################################################
+#                           Modify DataFrame Class                            #
+###############################################################################
+
+
+# This is only really useful in the CombinedData DataFrames
+def _beats_perm(self, column, mode='lt'):
+    """Returns a filtered dataframe of rows where column beats permutations.
+
+    Required that permutation calculations have already been done. Uses the
+    column name prefixed with 'perm_' to search for permutations.
+
+    e.g. a column of 'pvalue_open' would look for 'perm_pvalue_open'
+
+    Parameters
+    ----------
+    column : str
+    mode : str
+        One of lt (less than) or gt (greater than)
+
+    Returns
+    -------
+    DataFrame
+    """
+    if mode not in ['lt', 'gt']:
+        raise ValueError('Invalid mode: {}'.format({}))
+    if not column in self.columns:
+        raise ValueError('{} not a column'.format(column))
+    perm_col = 'perm_{}'.format(column)
+    if not perm_col in self.columns:
+        raise ValueError('Permutation column {} does not exist'
+                         .format(perm_col))
+    if mode == 'lt':
+        return self[self[column] < self[perm_col]]
+    return self[self[column] > self[perm_col]]
+
+_pd.DataFrame.beats_perm = _beats_perm
 
 ###############################################################################
 #                           Main Execution Function                           #
@@ -254,7 +296,7 @@ class CombinedData(object):
     diffs_done  = False
     perm_count  = 0
 
-    def __init__(self, directory, prefix_1=None, prefix_2=None,
+    def __init__(self, directory, mode='new', prefix_1=None, prefix_2=None,
                  suffix_1=None, suffix_2=None, merge_prefix=None):
         """Create merged data from pascal output directory.
 
@@ -262,6 +304,9 @@ class CombinedData(object):
         ----------
         directory : str
             The directory where the outputs are located
+        mode : str
+            One of 'new', 'auto', or 'read'. Use read if comparison has already
+            been generated and sample DataFrames are not required.
         prefix_1 : str
             The prefix, which comes from the name of the first input file minus
             the file extension
@@ -276,68 +321,87 @@ class CombinedData(object):
             A prefix to use for the merged files, defaults to the same as the
             directory name
         """
-        if not prefix_1 or not prefix_2:
-            if not merge_prefix or not suffix_1 or not suffix_2:
-                raise ValueError('Must provide prefices')
-        directory = _os.path.abspath(directory)
+        if mode not in ['new', 'read', 'auto']:
+            raise ValueError('Invalid mode: {}'.format(mode))
+
+        self.prefix_1  = prefix_1
+        self.prefix_2  = prefix_2
+        directory      = _os.path.abspath(directory)
         self.directory = directory
-        dirname = _os.path.basename(directory)
-        self.prefix = merge_prefix if merge_prefix else dirname
-        if prefix_1 and prefix_2:
+        dirname        = _os.path.basename(directory)
+        self.prefix    = merge_prefix if merge_prefix else dirname
+
+        fls = [
+            _pth(directory, self.prefix) + i for i in [
+                '.genescores.txt', '.fusion.genescores.txt',
+                '.numSnpError.txt', '.PathwaySet.txt'
+            ]
+        ]
+        not_found = []
+        for f in fls:
+            if not _os.path.isfile(f):
+                not_found.append(f)
+
+        if mode == 'auto':
+            mode = 'new' if not_found else 'read'
+
+        if mode == 'read' and not_found:
+            raise OSError('The following files were not found: {}, '
+                          .format(not_found) + 'cannot run in read mode')
+        if mode == 'new' and (not prefix_1 or not prefix_2):
+            raise ValueError('Must provide prefices')
+
+        if mode == 'new':
             self.sample_1 = PascalData(directory, prefix_1)
             self.sample_2 = PascalData(directory, prefix_2)
             self.sample_1_label = prefix_1
             self.sample_2_label = prefix_2
             suffix_1 = suffix_1 if suffix_1 else '{}'.format(prefix_1)
             suffix_2 = suffix_2 if suffix_2 else '{}'.format(prefix_2)
+
         if not suffix_1.startswith('_'):
             suffix_1 = '_' + suffix_1
         if not suffix_2.startswith('_'):
             suffix_2 = '_' + suffix_2
+
         self.suffix_1 = suffix_1
         self.suffix_2 = suffix_2
 
         # Make merged dataframes
-        fl = _pth(directory, self.prefix) + '.genescores.txt'
-        if _os.path.isfile(fl):
-            self.genescores = _pd.read_csv(fl, sep='\t')
-        else:
+        if mode == 'new':
             self.genescores = _pd.merge(
                 self.sample_1.genescores,
-                self.sample_2.genescores[['gene_id', 'numSnps',
-                                          'pvalue', 'Status']],
-                on='gene_id', suffixes=(suffix_1, suffix_2)
+                self.sample_2.genescores,
+                on=['chromosome', 'start', 'end', 'strand',
+                    'gene_id', 'gene_symbol'],
+                how='outer', suffixes=(suffix_1, suffix_2)
             )
-        fl = _pth(directory, self.prefix) + '.fusion.genescores.txt'
-        if _os.path.isfile(fl):
-            self.fgenescores = _pd.read_csv(fl, sep='\t')
-        else:
             self.fgenescores = _pd.merge(
                 self.sample_1.fgenescores,
-                self.sample_2.fgenescores[['gene_id', 'numSnps',
-                                           'pvalue', 'Status']],
-                on='gene_id', suffixes=(suffix_1, suffix_2)
+                self.sample_2.fgenescores,
+                on=['chromosome', 'start', 'end', 'strand',
+                    'gene_id', 'gene_symbol'],
+                how='outer', suffixes=(suffix_1, suffix_2)
             )
-        fl = _pth(directory, self.prefix) + '.numSnpError.txt'
-        if _os.path.isfile(fl):
-            self.snperr = _pd.read_csv(fl, sep='\t')
-        else:
             self.snperr = _pd.merge(
                 self.sample_1.snperr,
-                self.sample_2.snperr[['gene_id', 'SNPs']],
-                on='gene_id', suffixes=(suffix_1, suffix_2)
+                self.sample_2.snperr,
+                on=['gene_id', 'symbol'],
+                how='outer', suffixes=(suffix_1, suffix_2)
             )
-        fl = _pth(directory, self.prefix) + '.PathwaySet.txt'
-        if _os.path.isfile(fl):
-            self.pathway = _pd.read_csv(fl, sep='\t')
-        else:
             self.pathway = _pd.merge(
                 self.sample_1.pathway,
                 self.sample_2.pathway,
-                on='Name', suffixes=(suffix_1, suffix_2)
+                how='outer', on='Name', suffixes=(suffix_1, suffix_2)
             )
-        if 'pvalue_diff' not in self.genescores.columns:
             self.compute_differences()
+        else:
+            self.genescores  = _pd.read_csv(fls[0], sep='\t')
+            self.fgenescores = _pd.read_csv(fls[1], sep='\t')
+            self.snperr      = _pd.read_csv(fls[2], sep='\t')
+            self.pathway     = _pd.read_csv(fls[3], sep='\t')
+            if 'pvalue_diff' not in self.genescores.columns:
+                self.compute_differences()
 
     @property
     def length_differences(self):
@@ -423,7 +487,12 @@ class CombinedData(object):
         self.pathway.to_csv(prefix + '.PathwaySet.txt', sep='\t', index=False)
         self.snperr.to_csv(prefix + '.numSnpError.txt', sep='\t', index=False)
 
-    def add_perms(self, perm_dir=None, prefix=None):
+    ##################
+    #  Permutations  #
+    ##################
+
+    def add_perms(self, perm_dir=None, prefix=None, prefix_1=None,
+                  prefix_2=None):
         """Create new dataframes of permuted data.
 
         genescores, fgenescores, and pathway permuted dataframes are added,
@@ -445,11 +514,22 @@ class CombinedData(object):
         if not perm_dir:
             perm_dir = self.directory
         perm_dir = _os.path.abspath(perm_dir)
-        prefix = prefix if prefix else self.prefix
+        prefix   = prefix if prefix else self.prefix
+        prefix_1 = prefix_1 if prefix_1 else self.prefix_1
+        prefix_2 = prefix_2 if prefix_2 else self.prefix_2
+
         perm_genescores  = []
         perm_fgenescores = []
         perm_pathway     = []
         self.perm_count  = 0
+        s1 = self.suffix_1.strip('_')
+        s2 = self.suffix_2.strip('_')
+        gcols = ['gene_symbol', 'pvalue_diff', 'pvalue_log_diff',
+                 'snps_diff', 'pvalue_' + s1, 'pvalue_' + s2, 'perm']
+        pcols = ['Name', 'chi2Pvalue_diff', 'chi2Pvalue_log_diff',
+                 'empPvalue_diff', 'empPvalue_log_diff',
+                 'chi2Pvalue_' + s1, 'chi2Pvalue_' + s2,
+                 'empPvalue_' + s1, 'empPvalue_' + s2, 'perm']
         if _pb:
             pbar = _pb(unit=' perms')
         for pdir in [_pth(perm_dir, f) for f in _os.listdir(perm_dir)]:
@@ -459,31 +539,26 @@ class CombinedData(object):
                 continue
             try:
                 perm = int(pdir.split('_')[-1])
-                perm_prefix ='{}_perm_{}'.format(prefix, perm)
+                perm_prefix = '{}_perm_{}'.format(prefix, perm)
             except ValueError:
                 continue
-            try:
-                data = CombinedData(
-                    pdir, merge_prefix=perm_prefix,
-                    suffix_1=self.suffix_1, suffix_2=self.suffix_2
-                )
-            except:
-                continue
+            data = CombinedData(
+                pdir, mode='auto', merge_prefix=perm_prefix,
+                prefix_1='{}_perm_{}'.format(prefix_1, perm),
+                prefix_2='{}_perm_{}'.format(prefix_2, perm),
+                suffix_1=self.suffix_1, suffix_2=self.suffix_2
+            )
             data.genescores['perm'] = perm
-            cols = ['gene_symbol', 'pvalue_diff', 'pvalue_log_diff',
-                    'snps_diff', 'perm']
-            perm_genescores.append(data.genescores[cols].rename(
-                columns={i: 'perm_' + i for i in cols[1:-1]}
+            perm_genescores.append(data.genescores[gcols].rename(
+                columns={i: 'perm_' + i for i in gcols[1:-1]}
             ))
             data.fgenescores['perm'] = perm
-            perm_fgenescores.append(data.fgenescores[cols].rename(
-                columns={i: 'perm_' + i for i in cols[1:-1]}
+            perm_fgenescores.append(data.fgenescores[gcols].rename(
+                columns={i: 'perm_' + i for i in gcols[1:-1]}
             ))
             data.pathway['perm'] = perm
-            cols = ['Name', 'chi2Pvalue_diff', 'chi2Pvalue_log_diff',
-                    'empPvalue_diff', 'empPvalue_log_diff', 'perm']
-            perm_pathway.append(data.pathway[cols].rename(
-                columns={i: 'perm_' + i for i in cols[1:-1]}
+            perm_pathway.append(data.pathway[pcols].rename(
+                columns={i: 'perm_' + i for i in pcols[1:-1]}
             ))
             if _pb:
                 pbar.update()
@@ -504,69 +579,234 @@ class CombinedData(object):
 
         Also adds minimum pvalue column to every dataframe.
         """
+        s1 = self.suffix_1.strip('_')
+        s2 = self.suffix_2.strip('_')
+        gcols = ['perm_pvalue_diff', 'perm_pvalue_log_diff',
+                 'perm_snps_diff', 'perm', 'perm_pvalue_' + s1,
+                 'perm_pvalue_' + s2]
+        pcols = ['perm_chi2Pvalue_diff', 'perm_chi2Pvalue_log_diff',
+                 'perm_empPvalue_diff', 'perm_empPvalue_log_diff', 'perm',
+                 'perm_chi2Pvalue_' + s1, 'perm_chi2Pvalue_' + s2,
+                 'perm_empPvalue_' + s1, 'perm_empPvalue_' + s2]
+
+        self.mannwhitneyu = {
+            'genescores': {
+                'pvalue_log_diff': _sts.mannwhitneyu(
+                    self.genescores.pvalue_log_diff,
+                    self.perm_genescores.perm_pvalue_log_diff
+                ),
+                s1: _sts.mannwhitneyu(
+                    self.genescores['pvalue_' + s1],
+                    self.perm_genescores['perm_pvalue_' + s1]
+                ),
+                s2: _sts.mannwhitneyu(
+                    self.genescores['pvalue_' + s2],
+                    self.perm_genescores['perm_pvalue_' + s2]
+                )
+            },
+            'fgenescores': {
+                'pvalue_log_diff': _sts.mannwhitneyu(
+                    self.fgenescores.pvalue_log_diff,
+                    self.perm_fgenescores.perm_pvalue_log_diff
+                ),
+                s1: _sts.mannwhitneyu(
+                    self.fgenescores['pvalue_' + s1],
+                    self.perm_fgenescores['perm_pvalue_' + s1]
+                ),
+                s2: _sts.mannwhitneyu(
+                    self.fgenescores['pvalue_' + s2],
+                    self.perm_fgenescores['perm_pvalue_' + s2]
+                ),
+            },
+            'pathway_chi2': {
+                'chi2Pvalue_log_diff': _sts.mannwhitneyu(
+                    self.pathway.chi2Pvalue_log_diff,
+                    self.perm_pathway.perm_chi2Pvalue_log_diff
+                ),
+                s1: _sts.mannwhitneyu(
+                    self.pathway['chi2Pvalue_' + s1],
+                    self.perm_pathway['perm_chi2Pvalue_' + s1]
+                ),
+                s2: _sts.mannwhitneyu(
+                    self.pathway['chi2Pvalue_' + s2],
+                    self.perm_pathway['perm_chi2Pvalue_' + s2]
+                ),
+            },
+            'pathway_emp': {
+                'empPvalue_log_diff': _sts.mannwhitneyu(
+                    self.pathway.empPvalue_log_diff,
+                    self.perm_pathway.perm_empPvalue_log_diff
+                ),
+                s1: _sts.mannwhitneyu(
+                    self.pathway['empPvalue_' + s1],
+                    self.perm_pathway['perm_empPvalue_' + s1]
+                ),
+                s2: _sts.mannwhitneyu(
+                    self.pathway['empPvalue_' + s2],
+                    self.perm_pathway['perm_empPvalue_' + s2]
+                )
+            }
+        }
         summary = self.perm_genescores.groupby('gene_symbol').agg(
-            {'perm_pvalue_diff': _np.min,
+            {'perm_pvalue_' + s1: _np.min,
+             'perm_pvalue_' + s2: _np.min,
+             'perm_pvalue_diff': _np.min,
              'perm_pvalue_log_diff': _np.max,
              'perm_snps_diff': _np.max,
              'perm': _np.count_nonzero}
         ).reset_index()
-        self.genescores_mwu = _sts.mannwhitneyu(
-            self.genescores.pvalue_log_diff,
-            self.perm_genescores.perm_pvalue_log_diff
-        )
+        dcols = []
+        for i in gcols:
+            if i in self.genescores.columns:
+                dcols.append(i)
+        if dcols:
+            self.genescores.drop(dcols, axis=1, inplace=True)
         self.genescores = _pd.merge(
             self.genescores, summary, how='left', on='gene_symbol'
         )
         summary = self.perm_fgenescores.groupby('gene_symbol').agg(
-            {'perm_pvalue_diff': _np.min,
+            {'perm_pvalue_' + s1: _np.min,
+             'perm_pvalue_' + s2: _np.min,
+             'perm_pvalue_diff': _np.min,
              'perm_pvalue_log_diff': _np.max,
              'perm_snps_diff': _np.max,
              'perm': _np.count_nonzero}
         ).reset_index()
-        self.fgenescores_mwu = _sts.mannwhitneyu(
-            self.fgenescores.pvalue_log_diff,
-            self.perm_fgenescores.perm_pvalue_log_diff
-        )
+        dcols = []
+        for i in gcols:
+            if i in self.fgenescores.columns:
+                dcols.append(i)
+        if dcols:
+            self.fgenescores.drop(dcols, axis=1, inplace=True)
         self.fgenescores = _pd.merge(
             self.fgenescores, summary, how='left', on='gene_symbol'
         )
         summary = self.perm_pathway.groupby('Name').agg(
-            {'perm_chi2Pvalue_diff': _np.min,
+            {'perm_chi2Pvalue_' + s1: _np.min,
+             'perm_chi2Pvalue_' + s2: _np.min,
+             'perm_empPvalue_' + s1: _np.min,
+             'perm_empPvalue_' + s2: _np.min,
+             'perm_chi2Pvalue_diff': _np.min,
              'perm_chi2Pvalue_log_diff': _np.max,
              'perm_empPvalue_diff': _np.min,
              'perm_empPvalue_log_diff': _np.max,
              'perm': _np.count_nonzero}
         ).reset_index()
-        self.pathway_chi2_mwu = _sts.mannwhitneyu(
-            self.pathway.chi2Pvalue_log_diff,
-            self.perm_pathway.perm_chi2Pvalue_log_diff
-        )
-        self.pathway_emp_mwu = _sts.mannwhitneyu(
-            self.pathway.empPvalue_log_diff,
-            self.perm_pathway.perm_empPvalue_log_diff
-        )
+
+        dcols = []
+        for i in pcols:
+            if i in self.pathway.columns:
+                dcols.append(i)
+        if dcols:
+            self.pathway.drop(dcols, axis=1, inplace=True)
         self.pathway = _pd.merge(
             self.pathway, summary, how='left', on='Name'
         )
-        self.genescores['beats_perm'] = (
+        self.genescores['beats_perm_diff'] = (
             self.genescores.pvalue_log_diff >
             self.genescores.perm_pvalue_log_diff
         )
-        self.fgenescores['beats_perm'] = (
+        self.genescores['beats_perm_' + s1] = (
+            self.genescores['pvalue_' + s1] >
+            self.genescores['perm_pvalue_' + s1]
+        )
+        self.genescores['beats_perm_' + s2] = (
+            self.genescores['pvalue_' + s2] >
+            self.genescores['perm_pvalue_' + s2]
+        )
+        self.fgenescores['beats_perm_diff'] = (
             self.fgenescores.pvalue_log_diff >
             self.fgenescores.perm_pvalue_log_diff
         )
-        self.pathway['beats_perm_chi2'] = (
+        self.fgenescores['beats_perm_' + s1] = (
+            self.fgenescores['pvalue_' + s1] >
+            self.fgenescores['perm_pvalue_' + s1]
+        )
+        self.fgenescores['beats_perm_' + s2] = (
+            self.fgenescores['pvalue_' + s2] >
+            self.fgenescores['perm_pvalue_' + s2]
+        )
+        self.pathway['beats_perm_chi2_diff'] = (
             self.pathway.chi2Pvalue_log_diff >
             self.pathway.perm_chi2Pvalue_log_diff
         )
-        self.pathway['beats_perm_emp'] = (
+        self.pathway['beats_perm_chi2_' + s1] = (
+            self.pathway['chi2Pvalue_' + s1] >
+            self.pathway['perm_chi2Pvalue_' + s1]
+        )
+        self.pathway['beats_perm_chi2_' + s2] = (
+            self.pathway['chi2Pvalue_' + s2] >
+            self.pathway['perm_chi2Pvalue_' + s2]
+        )
+        self.pathway['beats_perm_emp_diff'] = (
             self.pathway.empPvalue_log_diff >
             self.pathway.perm_empPvalue_log_diff
         )
+        self.pathway['beats_perm_emp_' + s1] = (
+            self.pathway['empPvalue_' + s1] >
+            self.pathway['perm_empPvalue_' + s1]
+        )
+        self.pathway['beats_perm_emp_' + s2] = (
+            self.pathway['empPvalue_' + s2] >
+            self.pathway['perm_empPvalue_' + s2]
+        )
         self.diffs_done = True
 
+    @property
+    def permutation_summary(self):
+        """Return a string describing the permutation results by length."""
+        outar = [
+            "Completed a total of {perms} permutations.",
+            "",
+            "Pathway Analysis:",
+            "    empPvalue{suffix_1}:\t{emp1} beat permutations MWU: {m1:.4e}",
+            "    empPvalue{suffix_2}:\t{emp2} beat permutations MWU: {m2:.4e}",
+            "    empPvalue_log_diff:\t{emp3} beat permutations MWU: {m3:.4e}",
+            "    chi2Pvalue{suffix_1}:\t{chi1} beat permutations MWU: {m4:.4e}",
+            "    chi2Pvalue{suffix_2}:\t{chi2} beat permutations MWU: {m5:.4e}",
+            "    chi2Pvalue_log_diff:\t{chi3} beat permutations MWU: {m6:.4e}",
+            "",
+            "Genescores:",
+            "    pvalue{suffix_1}:\t{gs1} beat permutations MWU: {m7:.4e}",
+            "    pvalue{suffix_2}:\t{gs2} beat permutations MWU: {m8:.4e}",
+            "    pvalue_log_diff:\t{gs3} beat permutations MWU: {m9:.4e}",
+            "",
+            "Fusion Genescores:",
+            "    pvalue{suffix_1}:\t{fs1} beat permutations MWU: {m10:.4e}",
+            "    pvalue{suffix_2}:\t{fs2} beat permutations MWU: {m11:.4e}",
+            "    pvalue_log_diff:\t{fs3} beat permutations MWU: {m12:.4e}",
+        ]
+        return '\n'.join(outar).format(
+            perms=self.perm_count,
+            suffix_1=self.suffix_1, suffix_2=self.suffix_2,
+            emp1=len(self.pathway.beats_perm('empPvalue' + self.suffix_1)),
+            emp2=len(self.pathway.beats_perm('empPvalue' + self.suffix_2)),
+            emp3=len(self.pathway.beats_perm('empPvalue_log_diff', 'gt')),
+            chi1=len(self.pathway.beats_perm('chi2Pvalue' + self.suffix_1)),
+            chi2=len(self.pathway.beats_perm('chi2Pvalue' + self.suffix_2)),
+            chi3=len(self.pathway.beats_perm('chi2Pvalue_log_diff', 'gt')),
+            gs1=len(self.genescores.beats_perm('pvalue' + self.suffix_1)),
+            gs2=len(self.genescores.beats_perm('pvalue' + self.suffix_2)),
+            gs3=len(self.genescores.beats_perm('pvalue_log_diff', 'gt')),
+            fs1=len(self.fgenescores.beats_perm('pvalue' + self.suffix_1)),
+            fs2=len(self.fgenescores.beats_perm('pvalue' + self.suffix_2)),
+            fs3=len(self.fgenescores.beats_perm('pvalue_log_diff', 'gt')),
+            m1=self.mannwhitneyu['pathway_emp'][self.suffix_1.strip('_')].pvalue,
+            m2=self.mannwhitneyu['pathway_emp'][self.suffix_2.strip('_')].pvalue,
+            m3=self.mannwhitneyu['pathway_emp']['empPvalue_log_diff'].pvalue,
+            m4=self.mannwhitneyu['pathway_chi2'][self.suffix_1.strip('_')].pvalue,
+            m5=self.mannwhitneyu['pathway_chi2'][self.suffix_2.strip('_')].pvalue,
+            m6=self.mannwhitneyu['pathway_chi2']['chi2Pvalue_log_diff'].pvalue,
+            m7=self.mannwhitneyu['genescores'][self.suffix_1.strip('_')].pvalue,
+            m8=self.mannwhitneyu['genescores'][self.suffix_2.strip('_')].pvalue,
+            m9=self.mannwhitneyu['genescores']['pvalue_log_diff'].pvalue,
+            m10=self.mannwhitneyu['fgenescores'][self.suffix_1.strip('_')].pvalue,
+            m11=self.mannwhitneyu['fgenescores'][self.suffix_2.strip('_')].pvalue,
+            m12=self.mannwhitneyu['fgenescores']['pvalue_log_diff'].pvalue,
+        )
+
     def __repr__(self):
+        """Simple description of lengths of DFs."""
         return (
             "CombinedData<{}:genescores[{}],fgenescores[{}],"
             "pathwayset[{}],snperr[{}]>"
@@ -577,6 +817,12 @@ class CombinedData(object):
             len(self.pathway),
             len(self.snperr)
         )
+
+    def __str__(self):
+        """Display perm info if available, else simple lengths."""
+        if self.diffs_done:
+            return self.permutation_summary
+        return repr(self)
 
     def __len__(self):
         """Alias for perm_count."""
@@ -614,12 +860,15 @@ class CombinedData(object):
             pval1 = '{}Pvalue{}'.format(modifier, self.suffix_1)
             pval2 = '{}Pvalue{}'.format(modifier, self.suffix_2)
             bp  = 'beats_perm_{}'.format(modifier)
-            mwu = getattr(self, '{}_{}_mwu'.format(table, modifier))
+            mwu = self.mannwhitneyu[
+                '{}_{}'.format(table, modifier)][
+                '{}Pvalue_log_diff'.format(modifier)
+                ]
         else:
             pval1 = 'pvalue{}'.format(self.suffix_1)
             pval2 = 'pvalue{}'.format(self.suffix_2)
             bp  = 'beats_perm'
-            mwu = getattr(self, '{}_mwu'.format(table))
+            mwu = self.mannwhitneyu[table]['pvalue_log_diff']
         df = getattr(self, table)
         df = df.dropna(subset=[pval1, pval2])
 
@@ -793,13 +1042,13 @@ def plot_comparisons(data, folder=None, tables=None):
         data.plot(
             'pathway', modifier='chi2',
             title=name + ' Pathway Chi2',
-            write_to='{}.fusion.genescores.png'.format(prefix)
+            write_to='{}.PathwaySet.chi2.png'.format(prefix)
         )
     if 'pathway_emp' in tables:
         data.plot(
             'pathway', modifier='emp',
             title=name + ' Pathway emp',
-            write_to='{}.fusion.genescores.png'.format(prefix)
+            write_to='{}.PathwaySet.emp.png'.format(prefix)
         )
 
 
@@ -906,11 +1155,15 @@ def run_permutation(sample_1, sample_2, outdir, perms=1000,
         # Create the permutation files
         new_sample_1 = _pth(
             _os.path.abspath(perm_path),
-            _os.path.basename(sample_1) + '_perm_{}.txt'.format(perm)
+            '{}_perm_{}.txt'.format(
+                _os.path.splitext(_os.path.basename(sample_1))[0], perm
+            )
         )
         new_sample_2 = _pth(
             _os.path.abspath(perm_path),
-            _os.path.basename(sample_2) + '_perm_{}.txt'.format(perm)
+            '{}_perm_{}.txt'.format(
+                _os.path.splitext(_os.path.basename(sample_2))[0], perm
+            )
         )
         with open(new_sample_1, 'w') as fout:
             fout.write('\n'.join(new_sample_1_data))
@@ -979,6 +1232,8 @@ def run_permutation(sample_1, sample_2, outdir, perms=1000,
                     outputs[name] = outs
                     pbar.update()
             _sleep(1)
+            job = fyrd.submit(run_depict)
+            out = job.get()
 
     print('Permutation jobs completed.')
 
@@ -1091,13 +1346,15 @@ def analyse_comparison(sample_1, sample_2, outdir, perms=1000,
     print('Plotting')
     plot_comparisons(data)
 
-    print('Done')
+    print('Done\n')
+    print(data.permutation_summary)
 
     return data
 
 
 def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
-                       suffix_1=None, suffix_2=None, merge_prefix=None):
+                       suffix_1=None, suffix_2=None, merge_prefix=None,
+                       print_summary=False):
     """Build data object from pre-completed comparison and permutations.
 
     Parameters
@@ -1119,17 +1376,24 @@ def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
     merge_prefix : str, optional
         A prefix to use for the merged files, defaults to the same as the
         directory name
+    print_summary : bool
+        Print a summary of pvalues that have beaten permutations if done,
+        else print a simple string showing lengths of various dataframes.
 
     Returns
     -------
     CombinedData
     """
     print('Getting Data')
-    data = CombinedData(directory, prefix_1, prefix_2, suffix_1, suffix_2)
+    data = CombinedData(directory, mode='auto', merge_prefix=merge_prefix,
+                        prefix_1=prefix_1, prefix_2=prefix_2,
+                        suffix_1=suffix_1, suffix_2=suffix_2)
     print('Getting Permutations')
     data.add_perms(perm_dir=perm_dir, prefix=merge_prefix)
     print('{} permutations found'.format(data.perm_count))
     data.compare_to_perms()
+    if print_summary:
+        print(data.permutation_summary)
     return data
 
 
@@ -1501,12 +1765,23 @@ def argument_parser(get_pascal_args=False):
     )
     parse.add_argument('--plot', action='store_true',
                        help="Also write plot files for all tables")
+    parse.add_argument('--show-summary', action='store_true',
+                       help="Also print a summary of the permutations")
 
     # Write Plots
-    plot = modes.add_parser(
+    modes.add_parser(
         'plot', parents=[shared_outdir, shared_comp],
         help="Create scatter plots of exiting data."
     )
+
+    # Settings dump
+    settings = modes.add_parser(
+        'dump-settings',help='Dump a settings file for manual configuration' +
+        '. Use with --settings.'
+    )
+    settings.add_argument('-o', dest='outfile', default='settings.txt',
+                          help='Path to output file for settings, default ' +
+                          'settings.txt')
 
     return parser
 
@@ -1537,6 +1812,12 @@ def main(argv=None):
     opts = vars(args)
     if VERBOSE:
         print(opts)
+
+    if args.mode == 'dump-settings':
+        path, _ = get_runtime_info()
+        with open(_pth(path, 'settings.txt')) as fin, open(args.outfile, 'w') as fout:
+            fout.write(fin.read())
+        return 0
 
     outdir = args.outdir
     outdir = _os.path.abspath(outdir if outdir.strip() else _os.curdir)
@@ -1617,6 +1898,8 @@ def main(argv=None):
         if mode == 'plot' or args.plot:
             print('Plotting data')
             plot_comparisons(data)
+        if mode == 'parse' and args.show_summary:
+            print(data.permutation_summary)
         return 0
     else:
         parser.print_help()
