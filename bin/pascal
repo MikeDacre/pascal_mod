@@ -16,6 +16,13 @@ from random import randint as _randint
 # Get rid of pandas future warnings
 import warnings as _warn
 _warn.simplefilter(action='ignore', category=FutureWarning)
+_warn.simplefilter(action='ignore', category=UserWarning)
+
+# Try to use dill
+try:
+    import dill as _pickle
+except ImportError:
+    import pickle as _pickle
 
 # For analysis
 try:
@@ -65,7 +72,7 @@ VERBOSE = False  # Show debug output
 
 
 # This is only really useful in the CombinedData DataFrames
-def _beats_perm(self, column, mode='lt'):
+def _beats_perm(self, column, mode='lt', cutoff=None):
     """Returns a filtered dataframe of rows where column beats permutations.
 
     Required that permutation calculations have already been done. Uses the
@@ -78,6 +85,8 @@ def _beats_perm(self, column, mode='lt'):
     column : str
     mode : str
         One of lt (less than) or gt (greater than)
+    cutoff : float, optional
+        Drop rows that do not beat this number (uses mode to define choice)
 
     Returns
     -------
@@ -91,9 +100,17 @@ def _beats_perm(self, column, mode='lt'):
     if not perm_col in self.columns:
         raise ValueError('Permutation column {} does not exist'
                          .format(perm_col))
+    if cutoff is None:
+        df = self
+    else:
+        if mode == 'lt':
+            df = self[self[column] < cutoff]
+        elif mode == 'gt':
+            df = self[self[column] > cutoff]
+    df = df.dropna(subset=[column, perm_col])
     if mode == 'lt':
-        return self[self[column] < self[perm_col]]
-    return self[self[column] > self[perm_col]]
+        return df[df[column] < df[perm_col]]
+    return df[df[column] > df[perm_col]]
 
 _pd.DataFrame.beats_perm = _beats_perm
 
@@ -475,6 +492,7 @@ class CombinedData(object):
         <prefix>.fusion.genescores.txt
         <prefix>.PathwaySets.txt
         <prefix>.numSnpErrors.txt
+        <prefix>.CombinedData.pickle
         """
         outdir = outdir if outdir else self.directory
         prefix = prefix if prefix else self.prefix
@@ -486,6 +504,11 @@ class CombinedData(object):
                                 index=False)
         self.pathway.to_csv(prefix + '.PathwaySet.txt', sep='\t', index=False)
         self.snperr.to_csv(prefix + '.numSnpError.txt', sep='\t', index=False)
+        if self.diffs_done:
+            with open(prefix + '.perm_summary.txt', 'w') as fout:
+                fout.write(self.permutation_summary)
+        with open(prefix + '.CombinedData.pickle', 'wb') as fout:
+            _pickle.dump(self, fout)
 
     ##################
     #  Permutations  #
@@ -542,12 +565,16 @@ class CombinedData(object):
                 perm_prefix = '{}_perm_{}'.format(prefix, perm)
             except ValueError:
                 continue
-            data = CombinedData(
-                pdir, mode='auto', merge_prefix=perm_prefix,
-                prefix_1='{}_perm_{}'.format(prefix_1, perm),
-                prefix_2='{}_perm_{}'.format(prefix_2, perm),
-                suffix_1=self.suffix_1, suffix_2=self.suffix_2
-            )
+            try:
+                data = CombinedData(
+                    pdir, mode='auto', merge_prefix=perm_prefix,
+                    prefix_1='{}_perm_{}'.format(prefix_1, perm),
+                    prefix_2='{}_perm_{}'.format(prefix_2, perm),
+                    suffix_1=self.suffix_1, suffix_2=self.suffix_2
+                )
+            except:
+                # If one fails, it is no big deal, just move onto the next
+                continue
             data.genescores['perm'] = perm
             perm_genescores.append(data.genescores[gcols].rename(
                 columns={i: 'perm_' + i for i in gcols[1:-1]}
@@ -579,6 +606,9 @@ class CombinedData(object):
 
         Also adds minimum pvalue column to every dataframe.
         """
+        if not self.perms_added:
+            _sys.stderr.write('No permutations added yet, cannot compare')
+            return
         s1 = self.suffix_1.strip('_')
         s2 = self.suffix_2.strip('_')
         gcols = ['perm_pvalue_diff', 'perm_pvalue_log_diff',
@@ -752,29 +782,106 @@ class CombinedData(object):
         )
         self.diffs_done = True
 
+    def plot(self, table, modifier=None, xlabel=None, ylabel=None, title=None,
+             write_to=None):
+        """Plot a -log10 pvalue scatter graph for the given table.
+
+        Permutation information is included if pre-computed.
+
+        Parameters
+        ----------
+        table : str
+            One of 'genescores', 'fgenescores', or 'pathway'
+        modifier : str
+            If table is 'pathway' one of 'chi2' or 'emp'
+        xlabel, ylabel, title : str
+            Optional labels for the plot, defaults to existing labels
+        write_to : str
+            Path to a png, jpg, or pdf file to save the image
+
+        Returns
+        -------
+        fig, axes
+        """
+        if not _plots:
+            raise ImportError('Need plots to function')
+        if not table in ['genescores', 'fgenescores', 'pathway']:
+            raise ValueError('invalid table name')
+        if table == 'pathway':
+            if not modifier or modifier not in ['chi2', 'emp']:
+                raise ValueError('invalid modifier')
+            pval1 = '{}Pvalue{}'.format(modifier, self.suffix_1)
+            pval2 = '{}Pvalue{}'.format(modifier, self.suffix_2)
+            if self.diffs_done:
+                bp  = 'beats_perm_{}_diff'.format(modifier)
+                mwu = self.mannwhitneyu[
+                    '{}_{}'.format(table, modifier)][
+                    '{}Pvalue_log_diff'.format(modifier)
+                    ]
+            else:
+                bp = None
+        else:
+            pval1 = 'pvalue{}'.format(self.suffix_1)
+            pval2 = 'pvalue{}'.format(self.suffix_2)
+            if self.diffs_done:
+                bp  = 'beats_perm_diff'
+                mwu = self.mannwhitneyu[table]['pvalue_log_diff']
+            else:
+                bp = None
+        df = getattr(self, table)
+        if bp:
+            df = df.dropna(subset=[pval1, pval2, bp])
+        else:
+            df = df.dropna(subset=[pval1, pval2])
+
+        xlabel = xlabel if xlabel else self.suffix_1.strip('_')
+        ylabel = ylabel if ylabel else self.suffix_2.strip('_')
+        title  = title if title else _os.path.basename(self.directory)
+
+        kwargs = dict(
+            x=df[pval1], y=df[pval2], xlabel=xlabel, ylabel=ylabel,
+            pval=0.05, title=title, log_scale='negative',
+            reg_details=False
+        )
+
+        if self.diffs_done:
+            kwargs.update(dict(
+                highlight=df[bp],
+                highlight_label='Beats {} Permutations'.format(self.perm_count),
+                add_text='MWU P: {:.3}'.format(mwu.pvalue)
+            ))
+
+        f, a = _plots.scatter(**kwargs)
+
+        if write_to:
+            f.savefig(write_to)
+
+        return f, a
+
     @property
     def permutation_summary(self):
         """Return a string describing the permutation results by length."""
         outar = [
+            self.__repr__(), "",
             "Completed a total of {perms} permutations.",
             "",
             "Pathway Analysis:",
-            "    empPvalue{suffix_1}:\t{emp1} beat permutations MWU: {m1:.4e}",
-            "    empPvalue{suffix_2}:\t{emp2} beat permutations MWU: {m2:.4e}",
-            "    empPvalue_log_diff:\t{emp3} beat permutations MWU: {m3:.4e}",
-            "    chi2Pvalue{suffix_1}:\t{chi1} beat permutations MWU: {m4:.4e}",
-            "    chi2Pvalue{suffix_2}:\t{chi2} beat permutations MWU: {m5:.4e}",
-            "    chi2Pvalue_log_diff:\t{chi3} beat permutations MWU: {m6:.4e}",
+            "    empPvalue{suffix_1}:\t{emp1} beat permutations Best: {pemp1:.4e} MWU: {m1:.4e}",
+            "    empPvalue{suffix_2}:\t{emp2} beat permutations  Best: {pemp2:.4e} MWU: {m2:.4e}",
+            "    empPvalue_log_diff:\t{emp3} beat permutations Best: {pemp3:.3} MWU: {m3:.4e}",
+            "    chi2Pvalue{suffix_1}:\t{chi1} beat permutations Best: {pchi1:.4e} MWU: {m4:.4e}",
+            "    chi2Pvalue{suffix_2}:\t{chi2} beat permutations Best: {pchi2:.4e} MWU: {m5:.4e}",
+            "    chi2Pvalue_log_diff:\t{chi3} beat permutations Best: {pchi3:.3} MWU: {m6:.4e}",
             "",
             "Genescores:",
-            "    pvalue{suffix_1}:\t{gs1} beat permutations MWU: {m7:.4e}",
-            "    pvalue{suffix_2}:\t{gs2} beat permutations MWU: {m8:.4e}",
-            "    pvalue_log_diff:\t{gs3} beat permutations MWU: {m9:.4e}",
+            "    pvalue{suffix_1}:\t{gs1} beat permutations Best: {pgs1:.4e} MWU: {m7:.4e}",
+            "    pvalue{suffix_2}:\t{gs2} beat permutations Best: {pgs2:.4e} MWU: {m8:.4e}",
+            "    pvalue_log_diff:\t{gs3} beat permutations Best: {pgs3:.3} MWU: {m9:.4e}",
             "",
             "Fusion Genescores:",
-            "    pvalue{suffix_1}:\t{fs1} beat permutations MWU: {m10:.4e}",
-            "    pvalue{suffix_2}:\t{fs2} beat permutations MWU: {m11:.4e}",
-            "    pvalue_log_diff:\t{fs3} beat permutations MWU: {m12:.4e}",
+            "    pvalue{suffix_1}:\t{fs1} beat permutations Best: {pfs1:.4e} MWU: {m10:.4e}",
+            "    pvalue{suffix_2}:\t{fs2} beat permutations Best: {pfs2:.4e} MWU: {m11:.4e}",
+            "    pvalue_log_diff:\t{fs3} beat permutations Best: {pfs3:.3} MWU: {m12:.4e}",
         ]
         return '\n'.join(outar).format(
             perms=self.perm_count,
@@ -791,6 +898,18 @@ class CombinedData(object):
             fs1=len(self.fgenescores.beats_perm('pvalue' + self.suffix_1)),
             fs2=len(self.fgenescores.beats_perm('pvalue' + self.suffix_2)),
             fs3=len(self.fgenescores.beats_perm('pvalue_log_diff', 'gt')),
+            pemp1=self.pathway.beats_perm('empPvalue' + self.suffix_1)['empPvalue' + self.suffix_1].min(),
+            pemp2=self.pathway.beats_perm('empPvalue' + self.suffix_2)['empPvalue' + self.suffix_2].min(),
+            pemp3=self.pathway.beats_perm('empPvalue_log_diff', 'gt')['empPvalue_log_diff'].max(),
+            pchi1=self.pathway.beats_perm('chi2Pvalue' + self.suffix_1)['chi2Pvalue' + self.suffix_1].min(),
+            pchi2=self.pathway.beats_perm('chi2Pvalue' + self.suffix_2)['chi2Pvalue' + self.suffix_2].min(),
+            pchi3=self.pathway.beats_perm('chi2Pvalue_log_diff', 'gt')['chi2Pvalue_log_diff'].max(),
+            pgs1=self.genescores.beats_perm('pvalue' + self.suffix_1)['pvalue' + self.suffix_1].min(),
+            pgs2=self.genescores.beats_perm('pvalue' + self.suffix_2)['pvalue' + self.suffix_2].min(),
+            pgs3=self.genescores.beats_perm('pvalue_log_diff', 'gt')['pvalue_log_diff'].max(),
+            pfs1=self.fgenescores.beats_perm('pvalue' + self.suffix_1)['pvalue' + self.suffix_1].min(),
+            pfs2=self.fgenescores.beats_perm('pvalue' + self.suffix_2)['pvalue' + self.suffix_2].min(),
+            pfs3=self.fgenescores.beats_perm('pvalue_log_diff', 'gt')['pvalue_log_diff'].max(),
             m1=self.mannwhitneyu['pathway_emp'][self.suffix_1.strip('_')].pvalue,
             m2=self.mannwhitneyu['pathway_emp'][self.suffix_2.strip('_')].pvalue,
             m3=self.mannwhitneyu['pathway_emp']['empPvalue_log_diff'].pvalue,
@@ -828,73 +947,6 @@ class CombinedData(object):
         """Alias for perm_count."""
         return self.perm_count
 
-
-    def plot(self, table, modifier=None, xlabel=None, ylabel=None, title=None,
-             write_to=None):
-        """Plot a -log10 pvalue scatter graph for the given table.
-
-        Permutation information is included if pre-computed.
-
-        Parameters
-        ----------
-        table : str
-            One of 'genescores', 'fgenescores', or 'pathway'
-        modifier : str
-            If table is 'pathway' one of 'chi2' or 'emp'
-        xlabel, ylabel, title : str
-            Optional labels for the plot, defaults to existing labels
-        write_to : str
-            Path to a png, jpg, or pdf file to save the image
-
-        Returns
-        -------
-        fig, axes
-        """
-        if not _plots:
-            raise ImportError('Need plots to function')
-        if not table in ['genescores', 'fgenescores', 'pathway']:
-            raise ValueError('invalid table name')
-        if table == 'pathway':
-            if not modifier or modifier not in ['chi2', 'emp']:
-                raise ValueError('invalid modifier')
-            pval1 = '{}Pvalue{}'.format(modifier, self.suffix_1)
-            pval2 = '{}Pvalue{}'.format(modifier, self.suffix_2)
-            bp  = 'beats_perm_{}'.format(modifier)
-            mwu = self.mannwhitneyu[
-                '{}_{}'.format(table, modifier)][
-                '{}Pvalue_log_diff'.format(modifier)
-                ]
-        else:
-            pval1 = 'pvalue{}'.format(self.suffix_1)
-            pval2 = 'pvalue{}'.format(self.suffix_2)
-            bp  = 'beats_perm'
-            mwu = self.mannwhitneyu[table]['pvalue_log_diff']
-        df = getattr(self, table)
-        df = df.dropna(subset=[pval1, pval2])
-
-        xlabel = xlabel if xlabel else self.suffix_1.strip('_')
-        ylabel = ylabel if ylabel else self.suffix_2.strip('_')
-        title  = title if title else _os.path.basename(self.directory)
-
-        kwargs = dict(
-            x=df[pval1], y=df[pval2], xlabel=xlabel, ylabel=ylabel,
-            pval=0.05, title=title, log_scale='negative',
-            reg_details=False
-        )
-
-        if self.diffs_done:
-            kwargs.update(dict(
-                highlight=df[bp],
-                highlight_label='Beats {} Permutations'.format(self.perm_count),
-                add_text='MWU P: {:.3}'.format(mwu.pvalue)
-            ))
-
-        f, a = _plots.scatter(**kwargs)
-
-        if write_to:
-            f.savefig(write_to)
-
-        return f, a
 
 
 def run_pascal_comp(sample_1, sample_2, outdir='.', merge_prefix=None,
@@ -991,9 +1043,9 @@ def run_pascal_comp(sample_1, sample_2, outdir='.', merge_prefix=None,
     # Parse Outputs
     prefix_1 = _os.path.basename(_os.path.splitext(sample_1)[0])
     prefix_2 = _os.path.basename(_os.path.splitext(sample_2)[0])
-    print(outdir, prefix_1, prefix_2)
-    data = CombinedData(outdir, prefix_1, prefix_2,
-                        sample_1_label, sample_2_label)
+    data = CombinedData(outdir, prefix_1=prefix_1, prefix_2=prefix_2,
+                        suffix_1=sample_1_label, suffix_2=sample_2_label,
+                        merge_prefix=merge_prefix)
     if verbose:
         _sys.stderr.write('{} v {} lengths\n'.format(sample_1, sample_2))
         _sys.stderr.write(data.length_differences)
@@ -1352,9 +1404,27 @@ def analyse_comparison(sample_1, sample_2, outdir, perms=1000,
     return data
 
 
-def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
-                       suffix_1=None, suffix_2=None, merge_prefix=None,
-                       print_summary=False):
+def get_datafile(datafile=None, directory=None, prefix=None):
+    """Load a CombinedData pickled object.
+
+    Requires either the datafile, or the path and the prefix
+    """
+    if not datafile:
+        if not directory or not prefix:
+            raise ValueError('Must provide directory and prefix if datafile ' +
+                             'is not given')
+        datafile = _os.path.abspath(_pth(directory, prefix) +
+                                    '.CombinedData.pickle')
+    if not _os.path.isfile(datafile):
+        raise OSError('File not found: {}'.format(datafile))
+    with open(datafile, 'rb') as fin:
+        data = _pickle.load(fin)
+    return data
+
+
+def get_completed_data(directory, prefix_1=None, prefix_2=None,
+                       merge_prefix=None, add_perms=True, perm_dir=None,
+                       suffix_1=None, suffix_2=None, print_summary=False):
     """Build data object from pre-completed comparison and permutations.
 
     Parameters
@@ -1367,15 +1437,17 @@ def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
     prefix_2 : str
         The prefix, which comes from the name of the second input file
         minus the file extension
+    merge_prefix : str, optional
+        A prefix to use for the merged files, defaults to the same as the
+        directory name
+    add_perms : bool, optional
+        Add permutations to the CombinedData, default True
     perm_dir : str, optional
         Only provide if the permutation directory is different
     suffix_1 : str, optional
         A suffix to use for column names for this sample.
     suffix_2 : str, optional
         A suffix to use for column names for this sample.
-    merge_prefix : str, optional
-        A prefix to use for the merged files, defaults to the same as the
-        directory name
     print_summary : bool
         Print a summary of pvalues that have beaten permutations if done,
         else print a simple string showing lengths of various dataframes.
@@ -1384,17 +1456,155 @@ def get_completed_data(directory, prefix_1, prefix_2, perm_dir=None,
     -------
     CombinedData
     """
+    if merge_prefix:
+        pickle_file = _pth(directory, merge_prefix) + '.CombinedData.pickle'
+        if not _os.path.isfile(pickle_file):
+            if not prefix_1 or not prefix_2:
+                raise ValueError('Must provide prefix_1 and prefix_2 if no '
+                                 'pickled data file')
+    else:
+        if not prefix_1 or not prefix_2:
+            raise ValueError('Must provide prefix_1 and prefix_2 if no '
+                             'merge_prefix')
     print('Getting Data')
-    data = CombinedData(directory, mode='auto', merge_prefix=merge_prefix,
-                        prefix_1=prefix_1, prefix_2=prefix_2,
-                        suffix_1=suffix_1, suffix_2=suffix_2)
-    print('Getting Permutations')
-    data.add_perms(perm_dir=perm_dir, prefix=merge_prefix)
-    print('{} permutations found'.format(data.perm_count))
+    if merge_prefix and _os.path.isfile(pickle_file):
+        with open(pickle_file, 'rb') as fin:
+            data = _pickle.load(fin)
+    else:
+        data = CombinedData(directory, mode='auto', merge_prefix=merge_prefix,
+                            prefix_1=prefix_1, prefix_2=prefix_2,
+                            suffix_1=suffix_1, suffix_2=suffix_2)
+    if add_perms:
+        print('Getting Permutations')
+        data.add_perms(perm_dir=perm_dir, prefix=merge_prefix)
+        print('{} permutations found'.format(data.perm_count))
+    if not data.perm_count:
+        return data
     data.compare_to_perms()
     if print_summary:
         print(data.permutation_summary)
     return data
+
+
+def create_table_of_studies(study_info, suffix_1='sample_1',
+                            suffix_2='sample_2', outfile=None,
+                            add_perms=False):
+    """Create a DataFrame of study information for multiple runs.
+
+    All studies must have been previously parsed
+
+    Parameters
+    ----------
+    study_info : dict
+        Dictionary of {prefix: directory} for all studies.
+        Can also be a list. List will be turned into a dictionary. If a list
+        item contains ':' it will be split on that character for the dictionary
+        otherwise the dirctionary key and value will be the same (i.e. the
+        prefix and the directory will be identical). This is commonly the case.
+    suffix_1, suffix_2 : str, optional
+        Suffices for the two samples
+    outfile : str, optional
+        If provided, write a summary table to this file
+    add_perms : bool, optional
+        Add additional permutations to each study from permutations in their
+        root directory. Default False.
+
+    Return
+    ------
+    DataFrame
+        rows are the prefices, columns:
+            perms_done,
+            empPvalue_<suffix_1>, empPvalue_<suffix_2>, empPvalue_log_diff,
+            chi2Pvalue_<suffix_1>, chi2Pvalue_<suffix_2>, chi2Pvalue_log_diff,
+            genescores_pvalue_<suffix_1>, genescores_pvalue_<suffix_2>,
+            genescores_pvalue_log_diff, fgenescores_pvalue_<suffix_1>,
+            fgenescores_pvalue_<suffix_2>, fgenescores_pvalue_log_diff,
+            empPvalue_<suffix_1>_best, empPvalue_<suffix_2>_best, empPvalue_log_diff_best,
+            chi2Pvalue_<suffix_1>_best, chi2Pvalue_<suffix_2>_best, chi2Pvalue_log_diff_best,
+            genescores_pvalue_<suffix_1>_best, genescores_pvalue_<suffix_2>_best,
+            genescores_pvalue_log_diff_best, fgenescores_pvalue_<suffix_1>_best,
+            fgenescores_pvalue_<suffix_2>_best, fgenescores_pvalue_log_diff_best
+    """
+    if isinstance(study_info, (list, tuple, set)):
+        s = {}
+        for i in study_info:
+            if ':' in i:
+                k, v = i.split(':')
+                s[k] = v
+            else:
+                s[i] = i
+        study_info = s
+    columns = [
+        'perms_done',
+        "empPvalue_" + suffix_1, "empPvalue_" + suffix_2, "empPvalue_log_diff",
+        "chi2Pvalue_" + suffix_1, "chi2Pvalue_" + suffix_2, "chi2Pvalue_log_diff",
+        "genescores_pvalue_" + suffix_1, "genescores_pvalue_" + suffix_2,
+        "genescores_pvalue_log_diff", "fgenescores_pvalue_" + suffix_1,
+        "fgenescores_pvalue_" + suffix_2, "fgenescores_pvalue_log_diff",
+        "empPvalue_" + suffix_1 + "_best", "empPvalue_" + suffix_2 + "_best", "empPvalue_log_diff" + "_best",
+        "chi2Pvalue_" + suffix_1 + "_best", "chi2Pvalue_" + suffix_2 + "_best", "chi2Pvalue_log_diff" + "_best",
+        "genescores_pvalue_" + suffix_1 + "_best", "genescores_pvalue_" + suffix_2 + "_best",
+        "genescores_pvalue_log_diff" + "_best", "fgenescores_pvalue_" + suffix_1 + "_best",
+        "fgenescores_pvalue_" + suffix_2 + "_best", "fgenescores_pvalue_log_diff_best"
+    ]
+    index = []
+    rows = []
+    for prefix, directory in study_info.items():
+        print('Getting {}'.format(prefix))
+        try:
+            data = get_completed_data(
+                directory, merge_prefix=prefix, add_perms=add_perms
+            )
+        except ValueError as e:
+            if str(e) == (
+                "Must provide prefix_1 and prefix_2 if no pickled data file"
+            ):
+                _sys.stderr.write(
+                    '\nCannot build tables without pickled files. '
+                    'Parse the output data before running this function.\n'
+                    'Affected directory: {}\n\n'.format(directory)
+                )
+                continue
+            else:
+                continue
+        except:
+            _sys.stderr.write('Could not parse {}, skipping'.format(prefix))
+            continue
+        index.append(prefix)
+        rows.append([
+            data.perm_count,
+            len(data.pathway.beats_perm('empPvalue' + data.suffix_1)),
+            len(data.pathway.beats_perm('empPvalue' + data.suffix_2)),
+            len(data.pathway.beats_perm('empPvalue_log_diff', 'gt')),
+            len(data.pathway.beats_perm('chi2Pvalue' + data.suffix_1)),
+            len(data.pathway.beats_perm('chi2Pvalue' + data.suffix_2)),
+            len(data.pathway.beats_perm('chi2Pvalue_log_diff', 'gt')),
+            len(data.genescores.beats_perm('pvalue' + data.suffix_1)),
+            len(data.genescores.beats_perm('pvalue' + data.suffix_2)),
+            len(data.genescores.beats_perm('pvalue_log_diff', 'gt')),
+            len(data.fgenescores.beats_perm('pvalue' + data.suffix_1)),
+            len(data.fgenescores.beats_perm('pvalue' + data.suffix_2)),
+            len(data.fgenescores.beats_perm('pvalue_log_diff', 'gt')),
+            data.pathway.beats_perm('empPvalue' + data.suffix_1)['empPvalue' + data.suffix_1].min(),
+            data.pathway.beats_perm('empPvalue' + data.suffix_2)['empPvalue' + data.suffix_2].min(),
+            data.pathway.beats_perm('empPvalue_log_diff', 'gt')['empPvalue_log_diff'].max(),
+            data.pathway.beats_perm('chi2Pvalue' + data.suffix_1)['chi2Pvalue' + data.suffix_1].min(),
+            data.pathway.beats_perm('chi2Pvalue' + data.suffix_2)['chi2Pvalue' + data.suffix_2].min(),
+            data.pathway.beats_perm('chi2Pvalue_log_diff', 'gt')['chi2Pvalue_log_diff'].max(),
+            data.genescores.beats_perm('pvalue' + data.suffix_1)['pvalue' + data.suffix_1].min(),
+            data.genescores.beats_perm('pvalue' + data.suffix_2)['pvalue' + data.suffix_2].min(),
+            data.genescores.beats_perm('pvalue_log_diff', 'gt')['pvalue_log_diff'].max(),
+            data.fgenescores.beats_perm('pvalue' + data.suffix_1)['pvalue' + data.suffix_1].min(),
+            data.fgenescores.beats_perm('pvalue' + data.suffix_2)['pvalue' + data.suffix_2].min(),
+            data.fgenescores.beats_perm('pvalue_log_diff', 'gt')['pvalue_log_diff'].max(),
+        ])
+    df = _pd.DataFrame(rows, columns=columns, index=index)
+    if outfile:
+        if outfile.endswith('xls') or outfile.endswith('xlsx'):
+            df.to_excel(outfile)
+        else:
+            df.to_csv(outfile, sep='\t')
+    return df
 
 
 ###############################################################################
@@ -1763,16 +1973,39 @@ def argument_parser(get_pascal_args=False):
         help="Parse a directory containing combined data and permutations " +
         "and create new tables with integrated permutation information."
     )
+    parse.add_argument('--prefix',
+                       help="A prefix to use for merged files (defaults to " +
+                       "directory name). Sometimes makes parsing faster.")
     parse.add_argument('--plot', action='store_true',
                        help="Also write plot files for all tables")
     parse.add_argument('--show-summary', action='store_true',
                        help="Also print a summary of the permutations")
+    parse.add_argument('--write-summary',
+                       help="Also write the summary to this file")
+    parse.add_argument('--no-perms', action='store_false',
+                       help="Do not parse permutations")
 
-    # Write Plots
+    # Write Plots Only
     modes.add_parser(
         'plot', parents=[shared_outdir, shared_comp],
         help="Create scatter plots of exiting data."
     )
+
+    # Write a summary table
+    summary = modes.add_parser(
+        'summary', help='Write a summary table of study info'
+    )
+    summary.add_argument('outfile', help='file to write to')
+    summary.add_argument('study_info',
+                         help='study info in the format:\n ' +
+                         'prefix:directory,[prefix:directory,...]')
+    summary.add_argument('--suffix-1', default='sample_1',
+                         help='suffix used for sample 1')
+    summary.add_argument('--suffix-2', default='sample_2',
+                         help='suffix used for sample 2')
+    summary.add_argument('--add-perms', action='store_true',
+                         help='Also add new permutations to data')
+
 
     # Settings dump
     settings = modes.add_parser(
@@ -1818,6 +2051,19 @@ def main(argv=None):
         with open(_pth(path, 'settings.txt')) as fin, open(args.outfile, 'w') as fout:
             fout.write(fin.read())
         return 0
+    if args.mode == 'summary':
+        study_info = {}
+        for i in args.study_info.split(','):
+            if ':' in i:
+                k, v = i.split(':')
+                study_info[k] = v
+            else:
+                study_info[i] = i
+        create_table_of_studies(
+            study_info, suffix_1=args.suffix_1, suffix_2=args.suffix_2,
+            outfile=args.outfile, add_perms=args.add_perms
+        )
+        return 0
 
     outdir = args.outdir
     outdir = _os.path.abspath(outdir if outdir.strip() else _os.curdir)
@@ -1831,6 +2077,7 @@ def main(argv=None):
     sample_2 = opts.pop('sample_2')
     sample_1_label = opts.pop('s1_label')
     sample_2_label = opts.pop('s2_label')
+
     if mode == 'double':
         merge_prefix = opts.pop('prefix')
         if not merge_prefix:
@@ -1840,7 +2087,6 @@ def main(argv=None):
                         sample_1_label=sample_1_label,
                         sample_2_label=sample_2_label,
                         **opts)
-        return 0
     elif mode == 'permute':
         wait = opts.pop('no_wait')
         perms = opts.pop('perms')
@@ -1862,7 +2108,6 @@ def main(argv=None):
                         mem_per_job=mem, wait=wait,
                         start_perms=startat, fyrd_args=fyrd_args,
                         **opts)
-        return 0
     elif mode == 'analyze':
         wait = opts.pop('no_wait')
         perms = opts.pop('perms')
@@ -1884,13 +2129,13 @@ def main(argv=None):
                            mem_per_job=mem, wait=wait,
                            start_perms=startat, fyrd_args=fyrd_args,
                            **opts)
-        return 0
     elif mode == 'parse' or mode == 'plot':
         prefix_1 = _os.path.splitext(_os.path.basename(sample_1))[0]
         prefix_2 = _os.path.splitext(_os.path.basename(sample_2))[0]
         data = get_completed_data(
-            outdir, prefix_1, prefix_2,
-            suffix_1=sample_1_label, suffix_2=sample_2_label
+            outdir, prefix_1=prefix_1, prefix_2=prefix_2,
+            add_perms=args.no_perms, suffix_1=sample_1_label,
+            suffix_2=sample_2_label, merge_prefix=args.prefix
         )
         if mode == 'parse':
             print('Writing updated tables')
@@ -1899,11 +2144,17 @@ def main(argv=None):
             print('Plotting data')
             plot_comparisons(data)
         if mode == 'parse' and args.show_summary:
+            print('Summary:\n')
             print(data.permutation_summary)
-        return 0
+        if mode == 'parse' and args.write_summary:
+            with open(args.write_summary, 'w') as fout:
+                fout.write(data.permutation_summary + '\n')
+
     else:
         parser.print_help()
         return 1
+
+    return 0
 
 if __name__ == '__main__' and '__file__' in globals():
     _sys.exit(main())
