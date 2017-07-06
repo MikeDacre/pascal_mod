@@ -1,0 +1,15 @@
+#%Module1.0
+
+proc ModulesHelp { } {
+    puts stderr "pascal"
+}
+
+module-whatis  "pascal"
+
+set root       /home/dacre/code/Pascal
+
+module load anaconda
+prereq anaconda
+
+prepend-path PATH  $root/bin
+prepend-path LD_LIBRARY_PATH  $root/lib
